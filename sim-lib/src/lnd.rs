@@ -1,15 +1,18 @@
 use std::{collections::HashMap, str::FromStr};
 
-use crate::{LightningError, LightningNode, NodeInfo};
+use crate::{LightningError, LightningNode, NodeInfo, PaymentOutcome, PaymentResult};
 use async_trait::async_trait;
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::PublicKey;
+use lightning::events::PaymentFailureReason;
 use lightning::ln::{PaymentHash, PaymentPreimage};
+use tonic_lnd::routerrpc::TrackPaymentRequest;
 use tonic_lnd::{
     lnrpc::{GetInfoRequest, GetInfoResponse},
     routerrpc::SendPaymentRequest,
     Client,
 };
+use triggered::Listener;
 
 const KEYSEND_KEY: u64 = 5482373484;
 const SEND_PAYMENT_TIMEOUT_SECS: i32 = 300;
@@ -101,12 +104,73 @@ impl LightningNode for LndNode {
         Ok(payment_hash)
     }
 
-    async fn track_payment(&mut self, _hash: PaymentHash) -> Result<(), LightningError> {
-        unimplemented!()
+    async fn track_payment(
+        &self,
+        hash: PaymentHash,
+        shutdown: Listener,
+    ) -> Result<PaymentOutcome, LightningError> {
+        let mut client = self.client.clone();
+        let router_client = client.router();
+
+        let response = match router_client
+            .track_payment_v2(TrackPaymentRequest {
+                payment_hash: hash.0.to_vec(),
+                no_inflight_updates: false,
+            })
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                return Err(LightningError::TrackPaymentError(err.to_string()));
+            }
+        };
+
+        let mut stream = response.into_inner();
+
+        tokio::select! {
+            biased;
+            stream = stream.message() => {
+                let payment  = match stream {
+                    Ok(payment) => payment,
+                    Err(err) => {
+                        return Err(LightningError::TrackPaymentError(err.to_string()));
+                    }
+                };
+
+                match payment {
+                    Some(payment) => {
+
+                        let htlc_count = payment.htlcs.len();
+                        let settled = payment.status == 2 // routerrpc::PaymentStatus::SUCCEEDED
+                        || payment.status == 3; // routerrpc::PaymentStatus::FAILED
+
+                        let failure_reason = match payment.failure_reason {
+                            1 => Some(PaymentFailureReason::PaymentExpired),
+                            2 => Some(PaymentFailureReason::RouteNotFound),
+                            3 => Some(PaymentFailureReason::UnexpectedError),
+                            4 => Some(PaymentFailureReason::UnexpectedError), // TODO: Capture failure reasons for incorrect payment
+                            5 => Some(PaymentFailureReason::UnexpectedError), // TODO: Capture failure reasons for insufficient balance
+                            _ => None,
+                        };
+                        return Ok(PaymentOutcome::Resolved(PaymentResult {
+                            settled,
+                            htlc_count,
+                            failure_reason,
+                        }));
+                    },
+                    None => {
+                        return Err(LightningError::TrackPaymentError(
+                            "No payment".to_string(),
+                        ));
+                    },
+                }
+            },
+            _ = shutdown => { Err(LightningError::TrackPaymentError("Shutdown before tracking results".to_string())) }
+        }
     }
 }
 
-fn string_to_payment_hash(hash: &str) -> Result<PaymentHash, LightningError> {
+pub fn string_to_payment_hash(hash: &str) -> Result<PaymentHash, LightningError> {
     let bytes = hex::decode(hash).map_err(|_| LightningError::InvalidPaymentHash)?;
     let slice: [u8; 32] = bytes
         .as_slice()
