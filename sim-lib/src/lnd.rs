@@ -1,11 +1,13 @@
 use std::str::FromStr;
 
-use crate::{LightningError, LightningNode, NodeInfo};
+use crate::{LightningError, LightningNode, NodeInfo, PaymentOutcome};
 use async_trait::async_trait;
 use bitcoin::secp256k1::PublicKey;
 use lightning::ln::PaymentHash;
+use log::info;
 use tonic_lnd::{
     lnrpc::{GetInfoRequest, GetInfoResponse},
+    routerrpc::TrackPaymentRequest,
     Client,
 };
 
@@ -60,7 +62,27 @@ impl LightningNode for LndNode {
         unimplemented!()
     }
 
-    async fn track_payment(&self, _hash: PaymentHash) -> Result<(), LightningError> {
-        unimplemented!()
+    async fn track_payment(&self, hash: PaymentHash) -> Result<PaymentOutcome, LightningError> {
+        let mut client = self.client.clone();
+        let router_client = client.router();
+
+        let response = router_client
+            .track_payment_v2(TrackPaymentRequest {
+                payment_hash: hash.0.to_vec(),
+                no_inflight_updates: false,
+            })
+            .await?;
+
+        let mut stream = response.into_inner();
+
+        while let Some(payment) = stream.message().await? {
+            info!("Payment: {payment:?}");
+            if payment.status == 2 {
+                return Ok(PaymentOutcome::Success);
+            } else if payment.status == 3 {
+                return Ok(PaymentOutcome::Failure);
+            }
+        }
+        Ok(PaymentOutcome::Unknown)
     }
 }

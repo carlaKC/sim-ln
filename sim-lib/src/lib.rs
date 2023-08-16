@@ -59,6 +59,10 @@ pub enum LightningError {
     GetInfoError(String),
     #[error("Send payment error {0}")]
     SendPaymentError(String),
+    #[error("Track pyment error {0}")]
+    TrackPaymentError(String),
+    #[error("RPC error: {0:?}")]
+    RpcError(#[from] tonic_lnd::tonic::Status),
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +70,13 @@ pub struct NodeInfo {
     pub pubkey: PublicKey,
     pub alias: String,
     pub features: Vec<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub enum PaymentOutcome {
+    Success,
+    Failure,
+    Unknown,
 }
 
 /// LightningNode represents the functionality that is required to execute events on a lightning node.
@@ -82,7 +93,7 @@ pub trait LightningNode {
     ) -> Result<PaymentHash, LightningError>;
 
     /// Track a payment with the specified hash.
-    async fn track_payment(&self, hash: PaymentHash) -> Result<(), LightningError>;
+    async fn track_payment(&self, hash: PaymentHash) -> Result<PaymentOutcome, LightningError>;
 }
 
 #[derive(Clone, Copy)]
