@@ -208,7 +208,7 @@ async fn consume_events(
                 let payment = node.send_payment(dest, amt_msat);
 
                 match payment.await {
-                    Ok(payment_hash) => println!("Send payment: {:?}", payment_hash),
+                    Ok(payment_hash) => println!("Send payment: {:?} {:?}", payment_hash, amt_msat),
                     Err(_) => break,
                 };
             }

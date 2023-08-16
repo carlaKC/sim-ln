@@ -4,6 +4,8 @@ use crate::{
     utils::string_to_payment_hash, LightningError, LightningNode, NodeInfo, PaymentOutcome,
 };
 use async_trait::async_trait;
+use bitcoin::hashes::sha256::Hash as Sha256;
+use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::PublicKey;
 use lightning::ln::{PaymentHash, PaymentPreimage};
 use log::info;
@@ -71,6 +73,8 @@ impl LightningNode for LndNode {
             .map_err(|_| LightningError::SendPaymentError("Invalid send amount".to_string()))?;
 
         let preimage = PaymentPreimage(rand::random());
+        let payment_hash = Sha256::hash(&preimage.0);
+        let payment_hash_bytes = payment_hash.as_byte_array();
 
         let mut dest_custom_records = HashMap::new();
         dest_custom_records.insert(KEYSEND_KEY, preimage.0.to_vec());
@@ -80,6 +84,8 @@ impl LightningNode for LndNode {
                 amt_msat,
                 dest: dest.serialize().to_vec(),
                 dest_custom_records,
+                timeout_seconds: 60,
+                payment_hash: payment_hash_bytes.to_vec(),
                 ..Default::default()
             })
             .await?;
