@@ -157,7 +157,6 @@ impl Simulation {
 
         // Create a sender/receiver pair that will be used for reporting the outcomes of actions to the simulator.
         let (action_sender, action_receiver) = channel(1);
-
         self.record_data(
             action_receiver,
             shutdown_trigger.clone(),
@@ -175,12 +174,12 @@ impl Simulation {
         shutdown: Trigger,
         listener: Listener,
     ) {
-		log::debug!("Simulator data recording starting.");
+        log::debug!("Simulator data recording starting.");
         let mut set = tokio::task::JoinSet::new();
 
         // Create a sender/receiver pair that will be used to report final results of action outcomes.
         let (results_sender, results_receiver) = channel(1);
-		
+
         set.spawn(produce_simulation_results(
             self.nodes.clone(),
             action_receiver,
@@ -189,7 +188,7 @@ impl Simulation {
         ));
         set.spawn(consume_simulation_results(results_receiver, shutdown));
 
-		log::debug!("Simulator data recording exiting.");
+        log::debug!("Simulator data recording exiting.");
         // TODO: pass join set in and wait for threads to exit.
     }
 
@@ -282,6 +281,7 @@ async fn consume_events(
                             hex::encode(payment_hash.0)
                         );
 
+                        log::info!("Sending action for {:?}", payment_hash);
                         let outcome = ActionOutcome::PaymentSent(DispatchedPayment {
                             source: node.get_info().pubkey,
                             hash: payment_hash,
@@ -290,8 +290,13 @@ async fn consume_events(
                             dispatch_time: SystemTime::now(),
                         });
 
-                        if sender.send(outcome).await.is_err() {
-                            break;
+                        // TODO - this is failing!
+                        match sender.send(outcome).await {
+                            Ok(_) => {}
+                            Err(e) => {
+                                log::error!("Error sending action outcome: {:?}", e);
+                                break;
+                            }
                         }
                     }
                     Err(e) => {
@@ -375,6 +380,7 @@ async fn produce_simulation_results(
     loop {
         tokio::select! {
             outcome = outcomes.recv() => {
+                log::debug!(" Received outcome");
                 match outcome{
                     Some(action_outcome) => {
                         match action_outcome{
@@ -389,7 +395,10 @@ async fn produce_simulation_results(
                         };
 
                     },
-                    None => break,
+                    None => {
+                        log::debug!("Received none outcome");
+                        return
+                    }
                 }
             }
             _ = shutdown.clone() => {
@@ -408,7 +417,7 @@ async fn track_outcome(
     outcome: ActionOutcome,
     shutdown: Listener,
 ) {
-	log::debug!("Outcome tracker starting.");
+    log::debug!("Outcome tracker starting.");
 
     let node = node.lock().await;
 
@@ -427,5 +436,5 @@ async fn track_outcome(
         }
     }
 
-	log::debug!("Outcome tracker exiting.");
+    log::debug!("Outcome tracker exiting.");
 }
