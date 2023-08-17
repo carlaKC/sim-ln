@@ -10,9 +10,9 @@ use std::{collections::HashMap, sync::Arc};
 use thiserror::Error;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Mutex;
+use tokio::task::JoinSet;
 use tokio::time;
 use triggered::{Listener, Trigger};
-
 pub mod lnd;
 
 // Phase 0: User input - see config.json
@@ -153,43 +153,72 @@ impl Simulation {
             self.nodes.len()
         );
 
+        log::info!("CKC run / 1");
         let (shutdown_trigger, shutdown_listener) = triggered::trigger();
 
+        log::info!("CKC run / 2");
         // Create a sender/receiver pair that will be used for reporting the outcomes of actions to the simulator.
         let (action_sender, action_receiver) = channel(1);
-        self.record_data(
+        let mut record_data_set = self.record_data(
             action_receiver,
             shutdown_trigger.clone(),
             shutdown_listener.clone(),
-        )
-        .await;
+        );
 
-        self.generate_activity(action_sender, shutdown_trigger, shutdown_listener)
-            .await
+        log::info!("CKC run / 3");
+        // Create a sender/receiver pair that will be used for reporting the outcomes of actions to the simulator.
+        let mut generate_activity_set = self
+            .generate_activity(action_sender, shutdown_trigger, shutdown_listener)
+            .await?;
+
+        // We always want to wait ofr all threads to exit, so we wait for all of them to exit and track any errors
+        // that surface. It's okay if there are multiple and one is overwritten, we just want to know whether we
+        // exited with an error or not.
+        let mut success = true;
+        while let Some(res) = record_data_set.join_next().await {
+            if let Err(e) = res {
+                log::error!("Task exited with error: {e}");
+                success = false;
+            }
+        }
+        while let Some(res) = generate_activity_set.join_next().await {
+            if let Err(e) = res {
+                log::error!("Task exited with error: {e}");
+                success = false;
+            }
+        }
+        log::info!("CKC generate_activity / 7");
+        success.then_some(()).ok_or(SimulationError::TaskError)
     }
 
-    async fn record_data(
+    fn record_data(
         &self,
         action_receiver: Receiver<ActionOutcome>,
         shutdown: Trigger,
         listener: Listener,
-    ) {
+    ) -> tokio::task::JoinSet<()> {
         log::debug!("Simulator data recording starting.");
-        let mut set = tokio::task::JoinSet::new();
 
+        let mut set = JoinSet::new();
+        log::info!("CKC record_data / 1");
         // Create a sender/receiver pair that will be used to report final results of action outcomes.
         let (results_sender, results_receiver) = channel(1);
 
+        log::info!("CKC record_data / 2");
         set.spawn(produce_simulation_results(
             self.nodes.clone(),
             action_receiver,
             results_sender,
             listener,
         ));
+
+        log::info!("CKC record_data / 3");
         set.spawn(consume_simulation_results(results_receiver, shutdown));
 
+        log::info!("CKC record_data / 4");
         log::debug!("Simulator data recording exiting.");
-        // TODO: pass join set in and wait for threads to exit.
+
+        set
     }
 
     async fn generate_activity(
@@ -197,9 +226,9 @@ impl Simulation {
         executed_actions: Sender<ActionOutcome>,
         shutdown: Trigger,
         listener: Listener,
-    ) -> Result<(), SimulationError> {
-        let mut set = tokio::task::JoinSet::new();
-
+    ) -> Result<JoinSet<()>, SimulationError> {
+        let mut set = JoinSet::new();
+        log::info!("CKC generate_activity / 1");
         // Before we start the simulation, we'll spin up the infrastructure that we need to record data:
         // We only need to spin up producers for nodes that are contained in our activity description, as there will be
         // no events for nodes that are not source nodes.
@@ -216,6 +245,7 @@ impl Simulation {
             // events. We do not buffer channels as we expect events to clear quickly.
             let (sender, receiver) = channel(1);
 
+            log::info!("CKC generate_activity / 2");
             // Generate a consumer for the receiving end of the channel. It takes the event receiver that it'll pull
             // events from and the results sender to report the events it has triggered for further monitoring.
             set.spawn(consume_events(
@@ -225,12 +255,15 @@ impl Simulation {
                 shutdown.clone(),
             ));
 
+            log::info!("CKC generate_activity / 3");
             // Add the producer channel to our map so that various activity descriptions can use it. We may have multiple
             // activity descriptions that have the same source node.
             producer_channels.insert(id, sender);
         }
 
+        log::info!("CKC generate_activity / 4");
         for description in self.activity.iter() {
+            log::info!("CKC generate_activity / 5");
             let sender_chan = producer_channels.get(&description.source).unwrap();
             set.spawn(produce_events(
                 *description,
@@ -239,17 +272,7 @@ impl Simulation {
             ));
         }
 
-        // We always want to wait ofr all threads to exit, so we wait for all of them to exit and track any errors
-        // that surface. It's okay if there are multiple and one is overwritten, we just want to know whether we
-        // exited with an error or not.
-        let mut success = true;
-        while let Some(res) = set.join_next().await {
-            if let Err(e) = res {
-                log::error!("Task exited with error: {e}");
-                success = false;
-            }
-        }
-        success.then_some(()).ok_or(SimulationError::TaskError)
+        Ok(set)
     }
 }
 
@@ -264,16 +287,20 @@ async fn consume_events(
     sender: Sender<ActionOutcome>,
     shutdown: triggered::Trigger,
 ) {
+    log::info!("CKC consume_events / 1");
     let node_id = node.lock().await.get_info().pubkey;
     log::debug!("Started consumer for {}", node_id);
     while let Some(action) = receiver.recv().await {
         match action {
             NodeAction::SendPayment(dest, amt_msat) => {
+                log::info!("CKC consume_events / 2");
                 let mut node = node.lock().await;
                 let payment = node.send_payment(dest, amt_msat);
 
+                log::info!("CKC consume_events / 3");
                 match payment.await {
                     Ok(payment_hash) => {
+                        log::info!("CKC consume_events / 4");
                         log::info!(
                             "Send payment: {} -> {}: ({})",
                             node_id,
@@ -292,14 +319,18 @@ async fn consume_events(
 
                         // TODO - this is failing!
                         match sender.send(outcome).await {
-                            Ok(_) => {}
+                            Ok(_) => {
+                                log::info!("CKC consume_events / 5");
+                            }
                             Err(e) => {
+                                log::info!("CKC consume_events / 6");
                                 log::error!("Error sending action outcome: {:?}", e);
                                 break;
                             }
                         }
                     }
                     Err(e) => {
+                        log::info!("CKC consume_events / 7");
                         log::error!(
                             "Error while sending payment {} -> {}. Terminating consumer. {}",
                             node_id,
@@ -313,6 +344,7 @@ async fn consume_events(
         };
     }
 
+    log::info!("CKC consume_events / 8");
     // On exit call our shutdown trigger to inform other threads that we have exited, and they need to shut down.
     shutdown.trigger();
 }
@@ -323,6 +355,7 @@ async fn produce_events(act: ActivityDefinition, sender: Sender<NodeAction>, shu
     let e: NodeAction = NodeAction::SendPayment(act.destination, act.amount_msat);
     let interval = time::Duration::from_secs(act.frequency as u64);
 
+    log::info!("CKC produce_events / 8");
     log::debug!(
         "Started producer for {} every {}s: {} -> {}",
         act.amount_msat,
@@ -331,18 +364,23 @@ async fn produce_events(act: ActivityDefinition, sender: Sender<NodeAction>, shu
         act.destination
     );
 
+    log::info!("CKC produce_events / 9");
     loop {
         if time::timeout(interval, shutdown.clone()).await.is_ok() {
+            log::info!("CKC produce_events / 10");
             log::debug!(
                 "Stopped producer for {}: {} -> {}. Received shutdown signal.",
                 act.amount_msat,
                 act.source,
                 act.destination
             );
+
             break;
         }
 
+        log::info!("CKC produce_events / 11");
         if sender.send(e).await.is_err() {
+            log::info!("CKC produce_events / 12");
             break;
         }
     }
@@ -354,11 +392,14 @@ async fn consume_simulation_results(
 ) {
     log::debug!("Simulation results consumer started.");
 
+    log::info!("CKC consume_simulation_results / 1");
     while let Some(resolved_payment) = receiver.recv().await {
+        log::info!("CKC consume_simulation_results / 2");
         // TODO - write to CSV.
         println!("Resolved payment received: {:?}", resolved_payment);
     }
 
+    log::info!("CKC consume_simulation_results / 3");
     log::debug!("Simulation results consumer exiting");
     shutdown.trigger();
 }
