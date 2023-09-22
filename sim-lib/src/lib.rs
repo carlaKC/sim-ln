@@ -149,6 +149,14 @@ pub trait NetworkGenerator {
     ) -> Result<(PublicKey, u64), SimulationError>;
 }
 
+pub trait PaymentGenerator {
+    // Returns the number of seconds that a node should wait until firing its next payment.
+    fn next_payment_wait(&mut self) -> time::Duration;
+
+    // Returns a payment amount based on the capacity of the sending and receiving node.
+    fn payment_amount(&mut self, destination_capacity: u64) -> Result<u64, SimulationError>;
+}
+
 /// SimulationEvent describes the set of actions that the simulator can run on nodes that it has execution permissions
 /// on.
 #[derive(Clone, Copy)]
