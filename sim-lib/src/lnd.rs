@@ -8,15 +8,15 @@ use async_trait::async_trait;
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::Network;
+use fedimint_tonic_lnd::lnrpc::{payment::PaymentStatus, GetInfoRequest, GetInfoResponse};
+use fedimint_tonic_lnd::lnrpc::{ListChannelsRequest, NodeInfoRequest, PaymentFailureReason};
+use fedimint_tonic_lnd::routerrpc::TrackPaymentRequest;
+use fedimint_tonic_lnd::tonic::Code::Unavailable;
+use fedimint_tonic_lnd::tonic::Status;
+use fedimint_tonic_lnd::{routerrpc::SendPaymentRequest, Client};
 use lightning::ln::features::NodeFeatures;
 use lightning::ln::{PaymentHash, PaymentPreimage};
 use serde::{Deserialize, Serialize};
-use tonic_lnd::lnrpc::{payment::PaymentStatus, GetInfoRequest, GetInfoResponse};
-use tonic_lnd::lnrpc::{ListChannelsRequest, NodeInfoRequest, PaymentFailureReason};
-use tonic_lnd::routerrpc::TrackPaymentRequest;
-use tonic_lnd::tonic::Code::Unavailable;
-use tonic_lnd::tonic::Status;
-use tonic_lnd::{routerrpc::SendPaymentRequest, Client};
 use triggered::Listener;
 
 const KEYSEND_KEY: u64 = 5482373484;
@@ -59,7 +59,7 @@ fn parse_node_features(features: HashSet<u32>) -> NodeFeatures {
 impl LndNode {
     pub async fn new(connection: LndConnection) -> Result<Self, LightningError> {
         let mut client =
-            tonic_lnd::connect(connection.address, connection.cert, connection.macaroon)
+            fedimint_tonic_lnd::connect(connection.address, connection.cert, connection.macaroon)
                 .await
                 .map_err(|err| LightningError::ConnectionError(err.to_string()))?;
 
