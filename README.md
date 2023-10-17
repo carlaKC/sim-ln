@@ -90,6 +90,8 @@ not "drain" from the simulation.
 }
 ```
 
+*Note that IP addresses are not currently supported.*
+
 Nodes can be identified by an arbitrary string ("Alice", "CLN1", etc) or
 by their node public key. If a valid public key is provided it *must* 
 match the public key reported by the node.
