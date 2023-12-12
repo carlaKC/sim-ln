@@ -8,20 +8,37 @@ use bitcoin::hashes::Hash;
 use bitcoin::{secp256k1::PublicKey, Network};
 use lightning::ln::{PaymentHash, PaymentPreimage};
 use tokio::select;
-use tokio::sync::oneshot::{channel, Receiver as OneShotReceiver, Sender as OneShotSender};
+use tokio::sync::oneshot::{channel, Receiver, Sender};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use triggered::Listener;
 
 use crate::{LightningError, LightningNode, NodeInfo, PaymentResult};
 
-pub struct SimNetwork {
-    // TODO: make this less of a beast.
-    nodes: Arc<Mutex<HashMap<PublicKey, (NodeInfo, HashMap<u64, SimChannel>)>>>,
+pub struct Graph {
+    nodes: Arc<Mutex<HashMap<PublicKey, GraphEntry>>>,
     tasks: JoinSet<()>,
 }
 
-impl SimNetwork {
+struct GraphEntry {
+    node_info: NodeInfo,
+    node_channels: HashMap<u64, SimChannel>,
+}
+
+#[async_trait]
+trait SimNetwork {
+    fn dispatch_payment(
+        &mut self,
+        dest: PublicKey,
+        amount_msat: u64,
+        preimage: PaymentPreimage,
+    ) -> Receiver<Result<PaymentResult, LightningError>>;
+
+    async fn lookup_node(&self, node: &PublicKey) -> Result<GraphEntry, LightningError>;
+}
+
+#[async_trait]
+impl SimNetwork for Graph {
     /// dispatch_payment asynchronously propagates a payment through the simulated network, returning a tracking
     /// channel that can be used to obtain the result of the payment.
     fn dispatch_payment(
@@ -29,7 +46,7 @@ impl SimNetwork {
         dest: PublicKey,
         amount_msat: u64,
         preimage: PaymentPreimage,
-    ) -> OneShotReceiver<Result<PaymentResult, LightningError>> {
+    ) -> Receiver<Result<PaymentResult, LightningError>> {
         let (sender, receiver) = channel();
 
         self.tasks.spawn(propagate_payment(
@@ -42,14 +59,23 @@ impl SimNetwork {
 
         receiver
     }
+
+    async fn lookup_node(&self, node: &PublicKey) -> Result<GraphEntry, LightningError> {
+        match self.nodes.lock().await.get(node) {
+            Some(g) => Ok(*g),
+            None => Err(LightningError::GetNodeInfoError(
+                "Node not found".to_string(),
+            )),
+        }
+    }
 }
 
 async fn propagate_payment(
-    nodes: Arc<Mutex<HashMap<PublicKey, (NodeInfo, HashMap<u64, SimChannel>)>>>,
+    nodes: Arc<Mutex<HashMap<PublicKey, GraphEntry>>>,
     dest: PublicKey,
     amount_msat: u64,
     _preimage: PaymentPreimage,
-    sender: OneShotSender<Result<PaymentResult, LightningError>>,
+    sender: Sender<Result<PaymentResult, LightningError>>,
 ) {
     // TODO: pathfinding for actual route in the network.
     let route: Vec<Hop> = Vec::new();
@@ -57,7 +83,7 @@ async fn propagate_payment(
     // Lookup each hop in the route and add the HTLC to its mock channel.
     for hop in route {
         match nodes.lock().await.get_mut(&hop.node_id) {
-            Some((_, channels)) => match channels.get_mut(&hop.channel_id) {
+            Some(entry) => match entry.node_channels.get_mut(&hop.channel_id) {
                 Some(channel) => channel.add_htlc(hop.amount_msat),
                 None => {
                     let err = Err(LightningError::SendPaymentError(format!(
@@ -102,10 +128,10 @@ impl SimChannel {
     }
 }
 
-pub struct SimNode {
+pub struct SimNode<T: SimNetwork + Send + Sync> {
     info: NodeInfo,
-    network: SimNetwork,
-    in_flight: HashMap<PaymentHash, OneShotReceiver<Result<PaymentResult, LightningError>>>,
+    network: T,
+    in_flight: HashMap<PaymentHash, Receiver<Result<PaymentResult, LightningError>>>,
 }
 
 struct Hop {
@@ -115,7 +141,7 @@ struct Hop {
 }
 
 #[async_trait]
-impl LightningNode for SimNode {
+impl<T: SimNetwork + Send + Sync> LightningNode for SimNode<T> {
     fn get_info(&self) -> &NodeInfo {
         &self.info
     }
@@ -154,10 +180,7 @@ impl LightningNode for SimNode {
                 select! {
                     biased;
                     _ = listener => Err(LightningError::TrackPaymentError("shutdown during payment tracking".to_string())),
-                    res = receiver=> match res {
-                        Ok(r) => r,
-                        Err(e) => Err(LightningError::TrackPaymentError(format!("channel receive err: {}", e))),
-                    }
+                    res = receiver => res.map_err(|e| LightningError::TrackPaymentError(format!("channel receive err: {}", e)))?,
                 }
             }
             None => Err(LightningError::TrackPaymentError(format!(
@@ -168,23 +191,17 @@ impl LightningNode for SimNode {
     }
 
     async fn get_node_info(&mut self, node_id: &PublicKey) -> Result<NodeInfo, LightningError> {
-        match self.network.nodes.lock().await.get(node_id) {
-            Some((node, _)) => Ok(node.clone()),
-            None => Err(LightningError::GetNodeInfoError(
-                "Node not found".to_string(),
-            )),
-        }
+        Ok(self.network.lookup_node(node_id).await?.node_info)
     }
 
     async fn list_channels(&mut self) -> Result<Vec<u64>, LightningError> {
-        match self.network.nodes.lock().await.get(&self.info.pubkey) {
-            Some((_, channels)) => Ok(channels
-                .iter()
-                .map(|(_, channel)| channel.capacity)
-                .collect()),
-            None => Err(LightningError::ListChannelsError(
-                "Own node not found in network".to_string(),
-            )),
-        }
+        Ok(self
+            .network
+            .lookup_node(&self.info.pubkey)
+            .await?
+            .node_channels
+            .iter()
+            .map(|(_, channel)| channel.capacity)
+            .collect())
     }
 }
