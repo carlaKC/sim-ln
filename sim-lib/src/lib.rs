@@ -22,6 +22,7 @@ use self::random_activity::{NetworkGraphView, PaymentActivityGenerator};
 
 pub mod cln;
 pub mod lnd;
+pub mod sim_node;
 mod random_activity;
 mod serializers;
 #[cfg(test)]
