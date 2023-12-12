@@ -62,7 +62,9 @@ impl SimNetwork for Graph {
 
     async fn lookup_node(&self, node: &PublicKey) -> Result<GraphEntry, LightningError> {
         match self.nodes.lock().await.get(node) {
-            Some(g) => Ok(*g),
+            // don't want to copy here because then the values can be used for something iffy - we
+            // only want the channel state accessed under lock.
+            Some(g) => Ok(g),
             None => Err(LightningError::GetNodeInfoError(
                 "Node not found".to_string(),
             )),
@@ -180,7 +182,12 @@ impl<T: SimNetwork + Send + Sync> LightningNode for SimNode<T> {
                 select! {
                     biased;
                     _ = listener => Err(LightningError::TrackPaymentError("shutdown during payment tracking".to_string())),
-                    res = receiver => res.map_err(|e| LightningError::TrackPaymentError(format!("channel receive err: {}", e)))?,
+
+                    // If we get a payment result back, remove from our in flight set of payments and return the result.
+                    res = receiver => {
+                        self.in_flight.remove(&hash);
+                        res.map_err(|e| LightningError::TrackPaymentError(format!("channel receive err: {}", e)))?
+                    },
                 }
             }
             None => Err(LightningError::TrackPaymentError(format!(
