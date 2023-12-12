@@ -1,28 +1,32 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-
+use crate::{LightningError, LightningNode, NodeInfo, PaymentResult};
 use async_trait::async_trait;
-
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
 use bitcoin::{secp256k1::PublicKey, Network};
 use lightning::ln::{PaymentHash, PaymentPreimage};
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::select;
 use tokio::sync::oneshot::{channel, Receiver, Sender};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use triggered::Listener;
 
-use crate::{LightningError, LightningNode, NodeInfo, PaymentResult};
-
 pub struct Graph {
+    // nodes maps the public key of a node to a vector of its currently open channels (scid), used for graph lookups.
     nodes: Arc<Mutex<HashMap<PublicKey, GraphEntry>>>,
+
+    // channels maps the scid of a channel to its current state.
+    channels: Arc<Mutex<HashMap<u64, SimChannel>>>,
+
+    // track all tasks spawned to process payments in the graph.
     tasks: JoinSet<()>,
 }
 
+#[derive(Clone)]
 struct GraphEntry {
     node_info: NodeInfo,
-    node_channels: HashMap<u64, SimChannel>,
+    node_capacities: Vec<u64>,
 }
 
 #[async_trait]
@@ -50,7 +54,7 @@ impl SimNetwork for Graph {
         let (sender, receiver) = channel();
 
         self.tasks.spawn(propagate_payment(
-            self.nodes.clone(),
+            self.channels.clone(),
             dest,
             amount_msat,
             preimage,
@@ -60,11 +64,10 @@ impl SimNetwork for Graph {
         receiver
     }
 
+    /// lookup_node fetches a node's information from the graph.
     async fn lookup_node(&self, node: &PublicKey) -> Result<GraphEntry, LightningError> {
         match self.nodes.lock().await.get(node) {
-            // don't want to copy here because then the values can be used for something iffy - we
-            // only want the channel state accessed under lock.
-            Some(g) => Ok(g),
+            Some(g) => Ok(g.clone()),
             None => Err(LightningError::GetNodeInfoError(
                 "Node not found".to_string(),
             )),
@@ -73,7 +76,7 @@ impl SimNetwork for Graph {
 }
 
 async fn propagate_payment(
-    nodes: Arc<Mutex<HashMap<PublicKey, GraphEntry>>>,
+    nodes: Arc<Mutex<HashMap<u64, SimChannel>>>,
     dest: PublicKey,
     amount_msat: u64,
     _preimage: PaymentPreimage,
@@ -84,27 +87,12 @@ async fn propagate_payment(
 
     // Lookup each hop in the route and add the HTLC to its mock channel.
     for hop in route {
-        match nodes.lock().await.get_mut(&hop.node_id) {
-            Some(entry) => match entry.node_channels.get_mut(&hop.channel_id) {
-                Some(channel) => channel.add_htlc(hop.amount_msat),
-                None => {
-                    let err = Err(LightningError::SendPaymentError(format!(
-                        "channel {} not found for payment {} to {}",
-                        hop.channel_id, amount_msat, dest
-                    )));
-
-                    match sender.send(err) {
-                        Ok(_) => return,
-                        Err(_) => return,
-                    }
-
-                    // TODO: unroll HTLCs added so far
-                }
-            },
+        match nodes.lock().await.get_mut(&hop.channel_id) {
+            Some(channel) => channel.add_htlc(hop.amount_msat),
             None => {
                 let err = Err(LightningError::SendPaymentError(format!(
-                    "node {} not found for payment of {} to {}",
-                    hop.node_id, amount_msat, dest
+                    "channel {} not found for payment {} to {}",
+                    hop.channel_id, amount_msat, dest
                 )));
 
                 match sender.send(err) {
@@ -112,7 +100,7 @@ async fn propagate_payment(
                     Err(_) => return,
                 }
 
-                // TODO: unroll HTLCs added so far
+                // TODO: unroll HTLCs added so far if we error out
             }
         }
 
@@ -130,14 +118,13 @@ impl SimChannel {
     }
 }
 
-pub struct SimNode<T: SimNetwork + Send + Sync> {
+struct SimNode<T: SimNetwork + Send + Sync> {
     info: NodeInfo,
     network: T,
     in_flight: HashMap<PaymentHash, Receiver<Result<PaymentResult, LightningError>>>,
 }
 
 struct Hop {
-    node_id: PublicKey,
     channel_id: u64,
     amount_msat: u64,
 }
@@ -206,9 +193,6 @@ impl<T: SimNetwork + Send + Sync> LightningNode for SimNode<T> {
             .network
             .lookup_node(&self.info.pubkey)
             .await?
-            .node_channels
-            .iter()
-            .map(|(_, channel)| channel.capacity)
-            .collect())
+            .node_capacities)
     }
 }
