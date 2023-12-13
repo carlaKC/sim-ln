@@ -87,9 +87,10 @@ async fn propagate_payment(
 
     let preimage_bytes = Sha256::hash(&preimage.0[..]).to_byte_array();
     let payment_hash = PaymentHash(preimage_bytes);
+    let mut fail_idx = None;
 
     // Lookup each hop in the route and add the HTLC to its mock channel.
-    for hop in route {
+    for (i, hop) in route.iter().enumerate() {
         match nodes.lock().await.get_mut(&hop.channel_id) {
             Some(channel) => {
                 if channel
@@ -103,26 +104,59 @@ async fn propagate_payment(
                     )
                     .is_err()
                 {
-                    // TODO: unroll HTLC?
-                    return;
+                    fail_idx = Some(i);
+                    break;
                 }
             }
             None => {
+                fail_idx = Some(i);
                 let err = Err(LightningError::SendPaymentError(format!(
                     "channel {} not found for payment {} to {}",
                     hop.channel_id, amount_msat, dest
                 )));
 
-                match sender.send(err) {
-                    Ok(_) => return,
-                    Err(_) => return,
+                if sender.send(err).is_err() {
+                    // log a warning?
                 }
 
-                // TODO: unroll HTLCs added so far if we error out
+                break;
             }
         }
 
         // TODO: latency?
+        // TODO: fee check?
+    }
+
+    // Once we've added our HTLC along the route (either all the way, successfully, or part of the way, with a failure
+    // occurring along the way) we need to settle back the HTLC. We know the start point for this process and whether
+    // the HTLC succeeded based on whether our fail_idx was populated.
+    let resolution_idx = fail_idx.unwrap_or(route.len() - 1);
+    let success = fail_idx.is_none();
+
+    for i in resolution_idx..0 {
+        let hop = &route[i];
+
+        match nodes.lock().await.get_mut(&hop.channel_id) {
+            Some(channel) => {
+                if channel
+                    .remove_htlc(hop.node_out, payment_hash, success) // note: node out on the add
+                    // is node in on remove
+                    .is_err()
+                {
+                    panic!(
+                        "could not remove htlc {} from {}",
+                        hex::encode(payment_hash.0),
+                        hop.channel_id
+                    )
+                }
+            }
+            None => {
+                panic!(
+                    "successfully added HTLC not found on resolution: {}",
+                    hop.channel_id
+                )
+            }
+        }
     }
 }
 
@@ -188,6 +222,20 @@ impl ChannelParticipant {
             }
         }
     }
+
+    fn remove_outgoing_htlc(&mut self, hash: PaymentHash, success: bool) -> Result<HTLC, ()> {
+        match self.in_flight.remove(&hash) {
+            Some(v) => {
+                // If the HTLC failed, pending balance returns to local balance.
+                if !success {
+                    self.local_balance += v.amount_msat
+                }
+
+                Ok(v)
+            }
+            None => Err(()),
+        }
+    }
 }
 
 impl SimChannel {
@@ -205,6 +253,43 @@ impl SimChannel {
         }
 
         // TODO: add sanity check that values add up.
+        Err(())
+    }
+
+    fn remove_htlc(
+        &mut self,
+        incoming_node: PublicKey,
+        hash: PaymentHash,
+        success: bool,
+    ) -> Result<(), ()> {
+        if incoming_node == self.node_1.id {
+            if let Ok(htlc) = self.node_1.remove_outgoing_htlc(hash, success) {
+                // If the HTLC was settled, its amount is transferred to the remote party's local balance.
+                // If it was failed, the above removal has already dealt with balance management.
+                if success {
+                    self.node_2.local_balance += htlc.amount_msat
+                }
+
+                return Ok(());
+            } else {
+                return Err(());
+            }
+        }
+
+        if incoming_node == self.node_2.id {
+            if let Ok(htlc) = self.node_2.remove_outgoing_htlc(hash, success) {
+                // If the HTLC was settled, its amount is transferred to the remote party's local balance.
+                // If it was failed, the above removal has already dealt with balance management.
+                if success {
+                    self.node_1.local_balance += htlc.amount_msat
+                }
+
+                return Ok(());
+            } else {
+                return Err(());
+            }
+        }
+
         Err(())
     }
 }
