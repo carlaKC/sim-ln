@@ -115,7 +115,7 @@ async fn propagate_payment(
                 if channel
                     .add_htlc(
                         outgoing_node,
-                        HTLC {
+                        Htlc {
                             amount_msat: outgoing_amount,
                             cltv_expiry: outgoing_cltv,
                             hash: payment_hash,
@@ -208,7 +208,7 @@ async fn propagate_payment(
 }
 
 #[derive(Copy, Clone)]
-struct HTLC {
+struct Htlc {
     hash: PaymentHash,
     amount_msat: u64,
     cltv_expiry: u32,
@@ -227,7 +227,7 @@ struct ChannelParticipant {
     max_htlc: u64,
     max_in_flight: u64,
     local_balance: u64,
-    in_flight: HashMap<PaymentHash, HTLC>,
+    in_flight: HashMap<PaymentHash, Htlc>,
 }
 
 impl ChannelParticipant {
@@ -237,7 +237,7 @@ impl ChannelParticipant {
             .fold(0, |sum, val| sum + val.1.amount_msat)
     }
 
-    fn check_policy(&self, htlc: &HTLC) -> Result<(), ()> {
+    fn check_policy(&self, htlc: &Htlc) -> Result<(), ()> {
         if htlc.amount_msat > self.local_balance {
             return Err(());
         }
@@ -257,11 +257,11 @@ impl ChannelParticipant {
         Ok(())
     }
 
-    fn add_outgoing_htlc(&mut self, htlc: HTLC) -> Result<(), ()> {
+    fn add_outgoing_htlc(&mut self, htlc: Htlc) -> Result<(), ()> {
         self.check_policy(&htlc)?;
 
         match self.in_flight.get(&htlc.hash) {
-            Some(_) => return Err(()),
+            Some(_) => Err(()),
             None => {
                 self.local_balance -= htlc.amount_msat;
                 self.in_flight.insert(htlc.hash, htlc);
@@ -270,7 +270,7 @@ impl ChannelParticipant {
         }
     }
 
-    fn remove_outgoing_htlc(&mut self, hash: PaymentHash, success: bool) -> Result<HTLC, ()> {
+    fn remove_outgoing_htlc(&mut self, hash: PaymentHash, success: bool) -> Result<Htlc, ()> {
         match self.in_flight.remove(&hash) {
             Some(v) => {
                 // If the HTLC failed, pending balance returns to local balance.
@@ -286,7 +286,7 @@ impl ChannelParticipant {
 }
 
 impl SimChannel {
-    fn add_htlc(&mut self, node: PublicKey, htlc: HTLC) -> Result<(), ()> {
+    fn add_htlc(&mut self, node: PublicKey, htlc: Htlc) -> Result<(), ()> {
         if htlc.amount_msat == 0 {
             return Err(());
         }
