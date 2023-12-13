@@ -79,16 +79,34 @@ async fn propagate_payment(
     nodes: Arc<Mutex<HashMap<u64, SimChannel>>>,
     dest: PublicKey,
     amount_msat: u64,
-    _preimage: PaymentPreimage,
+    preimage: PaymentPreimage,
     sender: Sender<Result<PaymentResult, LightningError>>,
 ) {
     // TODO: pathfinding for actual route in the network.
     let route: Vec<Hop> = Vec::new();
 
+    let preimage_bytes = Sha256::hash(&preimage.0[..]).to_byte_array();
+    let payment_hash = PaymentHash(preimage_bytes);
+
     // Lookup each hop in the route and add the HTLC to its mock channel.
     for hop in route {
         match nodes.lock().await.get_mut(&hop.channel_id) {
-            Some(channel) => channel.add_htlc(hop.amount_msat),
+            Some(channel) => {
+                if channel
+                    .add_htlc(
+                        hop.node_out,
+                        HTLC {
+                            amount_msat: hop.amount_msat,
+                            cltv_expiry: hop.cltv_expiry,
+                            hash: payment_hash,
+                        },
+                    )
+                    .is_err()
+                {
+                    // TODO: unroll HTLC?
+                    return;
+                }
+            }
             None => {
                 let err = Err(LightningError::SendPaymentError(format!(
                     "channel {} not found for payment {} to {}",
@@ -108,13 +126,86 @@ async fn propagate_payment(
     }
 }
 
+#[derive(Copy, Clone)]
+struct HTLC {
+    hash: PaymentHash,
+    amount_msat: u64,
+    cltv_expiry: u32,
+}
+
 struct SimChannel {
-    capacity: u64,
+    node_1: ChannelParticipant,
+    node_2: ChannelParticipant,
+
+    // Total capacity of the channel expressed in msat.
+    capacity_msat: u64,
+}
+
+struct ChannelParticipant {
+    id: PublicKey,
+    max_htlc: u64,
+    max_in_flight: u64,
+    local_balance: u64,
+    in_flight: HashMap<PaymentHash, HTLC>,
+}
+
+impl ChannelParticipant {
+    fn check_policy(
+        &self,
+        htlc: &HTLC,
+        balance: u64,
+        htlcs: &HashMap<PaymentHash, HTLC>,
+    ) -> Result<(), ()> {
+        if htlc.amount_msat > balance {
+            return Err(());
+        }
+
+        if htlcs.len() as u64 + 1 > self.max_htlc {
+            return Err(());
+        }
+
+        let in_flight_total = htlcs.iter().fold(0, |sum, val| sum + val.1.amount_msat);
+        if in_flight_total + htlc.amount_msat > self.max_in_flight {
+            return Err(());
+        }
+
+        if htlc.cltv_expiry > 500000000 {
+            return Err(());
+        }
+
+        Ok(())
+    }
+
+    fn add_outgoing_htlc(&mut self, htlc: HTLC) -> Result<(), ()> {
+        self.check_policy(&htlc, self.local_balance, &self.in_flight)?;
+
+        match self.in_flight.get(&htlc.hash) {
+            Some(_) => return Err(()),
+            None => {
+                self.local_balance -= htlc.amount_msat;
+                self.in_flight.insert(htlc.hash, htlc);
+                Ok(())
+            }
+        }
+    }
 }
 
 impl SimChannel {
-    fn add_htlc(&mut self, _amount_msat: u64) {
-        unimplemented!()
+    fn add_htlc(&mut self, node: PublicKey, htlc: HTLC) -> Result<(), ()> {
+        if htlc.amount_msat == 0 {
+            return Err(());
+        }
+
+        if node == self.node_1.id {
+            return self.node_1.add_outgoing_htlc(htlc);
+        }
+
+        if node == self.node_2.id {
+            return self.node_2.add_outgoing_htlc(htlc);
+        }
+
+        // TODO: add sanity check that values add up.
+        Err(())
     }
 }
 
@@ -125,8 +216,11 @@ struct SimNode<T: SimNetwork + Send + Sync> {
 }
 
 struct Hop {
+    // TODO: figure out how LDK frames this?
+    node_out: PublicKey,
     channel_id: u64,
     amount_msat: u64,
+    cltv_expiry: u32,
 }
 
 #[async_trait]
