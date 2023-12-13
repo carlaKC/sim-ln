@@ -4,6 +4,7 @@ use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
 use bitcoin::{secp256k1::PublicKey, Network};
 use lightning::ln::{PaymentHash, PaymentPreimage};
+use lightning::routing::router::Path;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::select;
@@ -33,6 +34,7 @@ struct GraphEntry {
 trait SimNetwork {
     fn dispatch_payment(
         &mut self,
+        source: PublicKey,
         dest: PublicKey,
         amount_msat: u64,
         preimage: PaymentPreimage,
@@ -47,6 +49,7 @@ impl SimNetwork for Graph {
     /// channel that can be used to obtain the result of the payment.
     fn dispatch_payment(
         &mut self,
+        source: PublicKey,
         dest: PublicKey,
         amount_msat: u64,
         preimage: PaymentPreimage,
@@ -55,6 +58,7 @@ impl SimNetwork for Graph {
 
         self.tasks.spawn(propagate_payment(
             self.channels.clone(),
+            source,
             dest,
             amount_msat,
             preimage,
@@ -77,42 +81,65 @@ impl SimNetwork for Graph {
 
 async fn propagate_payment(
     nodes: Arc<Mutex<HashMap<u64, SimChannel>>>,
+    source: PublicKey,
     dest: PublicKey,
     amount_msat: u64,
     preimage: PaymentPreimage,
     sender: Sender<Result<PaymentResult, LightningError>>,
 ) {
     // TODO: pathfinding for actual route in the network.
-    let route: Vec<Hop> = Vec::new();
+    let route = Path {
+        hops: vec![],
+        blinded_tail: None,
+    };
+
+    // Get values for the first HTLC we'll send from the source node.
+    let mut outgoing_node = source;
+    let mut outgoing_amount = route.fee_msat() + route.final_value_msat();
+    let mut outgoing_cltv = route
+        .hops
+        .iter()
+        .fold(0, |sum, value| sum + value.cltv_expiry_delta);
 
     let preimage_bytes = Sha256::hash(&preimage.0[..]).to_byte_array();
     let payment_hash = PaymentHash(preimage_bytes);
+
     let mut fail_idx = None;
+    let mut require_resolution = false;
 
     // Lookup each hop in the route and add the HTLC to its mock channel.
-    for (i, hop) in route.iter().enumerate() {
-        match nodes.lock().await.get_mut(&hop.channel_id) {
+    for (i, hop) in route.hops.iter().enumerate() {
+        match nodes.lock().await.get_mut(&hop.short_channel_id) {
             Some(channel) => {
                 if channel
                     .add_htlc(
-                        hop.node_out,
+                        outgoing_node,
                         HTLC {
-                            amount_msat: hop.amount_msat,
-                            cltv_expiry: hop.cltv_expiry,
+                            amount_msat: outgoing_amount,
+                            cltv_expiry: outgoing_cltv,
                             hash: payment_hash,
                         },
                     )
                     .is_err()
                 {
-                    fail_idx = Some(i);
+                    // Note: do this in a better way?
+                    if i != 0 {
+                        fail_idx = Some(i - 1);
+                        require_resolution = true;
+                    }
+
                     break;
                 }
             }
             None => {
-                fail_idx = Some(i);
+                if i != 0 {
+                    fail_idx = Some(i - 1);
+                    require_resolution = true;
+                }
+
                 let err = Err(LightningError::SendPaymentError(format!(
                     "channel {} not found for payment {} to {}",
-                    hop.channel_id, amount_msat, dest
+                    hop.short_channel_id, amount_msat, dest
                 )));
 
                 if sender.send(err).is_err() {
@@ -123,37 +150,52 @@ async fn propagate_payment(
             }
         }
 
+        // Once we've taken the "hop" to the destination pubkey, it becomes the source of the next outgoing htlc.
+        outgoing_node = hop.pubkey;
+        outgoing_amount -= hop.fee_msat;
+        outgoing_cltv -= hop.cltv_expiry_delta;
+
         // TODO: latency?
         // TODO: fee check?
+    }
+
+    // If we failed adding our very first hop then we don't need to unwrap any htlcs.
+    if !require_resolution {
+        return;
     }
 
     // Once we've added our HTLC along the route (either all the way, successfully, or part of the way, with a failure
     // occurring along the way) we need to settle back the HTLC. We know the start point for this process and whether
     // the HTLC succeeded based on whether our fail_idx was populated.
-    let resolution_idx = fail_idx.unwrap_or(route.len() - 1);
+    let resolution_idx = fail_idx.unwrap_or(route.hops.len() - 1);
     let success = fail_idx.is_none();
 
     for i in resolution_idx..0 {
-        let hop = &route[i];
+        let hop = &route.hops[i];
 
-        match nodes.lock().await.get_mut(&hop.channel_id) {
+        let incoming_node = if i == 0 {
+            source
+        } else {
+            route.hops[i - 1].pubkey
+        };
+
+        match nodes.lock().await.get_mut(&hop.short_channel_id) {
             Some(channel) => {
                 if channel
-                    .remove_htlc(hop.node_out, payment_hash, success) // note: node out on the add
-                    // is node in on remove
+                    .remove_htlc(incoming_node, payment_hash, success)
                     .is_err()
                 {
                     panic!(
                         "could not remove htlc {} from {}",
                         hex::encode(payment_hash.0),
-                        hop.channel_id
+                        hop.short_channel_id
                     )
                 }
             }
             None => {
                 panic!(
                     "successfully added HTLC not found on resolution: {}",
-                    hop.channel_id
+                    hop.short_channel_id
                 )
             }
         }
@@ -346,7 +388,9 @@ impl<T: SimNetwork + Send + Sync> LightningNode for SimNode<T> {
         amount_msat: u64,
     ) -> Result<PaymentHash, LightningError> {
         let preimage = PaymentPreimage(rand::random());
-        let payment_receiver = self.network.dispatch_payment(dest, amount_msat, preimage);
+        let payment_receiver =
+            self.network
+                .dispatch_payment(self.info.pubkey, dest, amount_msat, preimage);
 
         let preimage_bytes = Sha256::hash(&preimage.0[..]).to_byte_array();
         let payment_hash = PaymentHash(preimage_bytes);
