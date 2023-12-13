@@ -178,8 +178,8 @@ async fn propagate_payment(
         let incoming_node = if i == 0 {
             source
         } else {
-			// Note: this is a _hideous_ workaround for the fact that we're using a different
-			// version of bitcoin dep than LDK.
+            // Note: this is a _hideous_ workaround for the fact that we're using a different
+            // version of bitcoin dep than LDK.
             let pubkey_str = format!("{}", route.hops[i - 1].pubkey);
             PublicKey::from_str(&pubkey_str).unwrap()
         };
@@ -365,14 +365,6 @@ struct SimNode<T: SimNetwork + Send + Sync> {
     info: NodeInfo,
     network: T,
     in_flight: HashMap<PaymentHash, Receiver<Result<PaymentResult, LightningError>>>,
-}
-
-struct Hop {
-    // TODO: figure out how LDK frames this?
-    node_out: PublicKey,
-    channel_id: u64,
-    amount_msat: u64,
-    cltv_expiry: u32,
 }
 
 #[async_trait]
