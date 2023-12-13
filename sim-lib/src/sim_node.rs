@@ -110,6 +110,9 @@ async fn propagate_payment(
 
     // Lookup each hop in the route and add the HTLC to its mock channel.
     for (i, hop) in route.hops.iter().enumerate() {
+        let pubkey_str = format!("{}", hop.pubkey);
+        let hop_pubkey = PublicKey::from_str(&pubkey_str).unwrap();
+
         match nodes.lock().await.get_mut(&hop.short_channel_id) {
             Some(channel) => {
                 if channel
@@ -130,6 +133,31 @@ async fn propagate_payment(
                     }
 
                     break;
+                }
+
+                // Once we've added the HTLC on this hop's channel, we want to check whether it has sufficient fee
+                // and CLTV delta per the _next_ channel's policy (because fees and CLTV delta in LN are charged on
+                // the outgoing link). We check the policy belonging to the node that we just forwarded to, which
+                // represents the fee in that direction. Note that we don't check the final hop's requirements for CLTV
+                // delta, that's out of scope at present.
+                if i != route.hops.len() - 1 {
+                    if let Some(channel) =
+                        nodes.lock().await.get(&route.hops[i + 1].short_channel_id)
+                    {
+                        if channel
+                            .check_htlc_forward(
+                                hop_pubkey,
+                                hop.cltv_expiry_delta,
+                                outgoing_amount - hop.fee_msat, // TODO: check the amount that we calc fee on
+                                hop.fee_msat,
+                            )
+                            .is_err()
+                        {
+                            // If we haven't met forwarding conditions for the next channel's policy, then we fail at
+                            // index i, because we've already added the HTLC as outgoing.
+                            fail_idx = Some(i)
+                        }
+                    }
                 }
             }
             None => {
@@ -152,13 +180,11 @@ async fn propagate_payment(
         }
 
         // Once we've taken the "hop" to the destination pubkey, it becomes the source of the next outgoing htlc.
-        let pubkey_str = format!("{}", hop.pubkey);
-        outgoing_node = PublicKey::from_str(&pubkey_str).unwrap();
+        outgoing_node = hop_pubkey;
         outgoing_amount -= hop.fee_msat;
         outgoing_cltv -= hop.cltv_expiry_delta;
 
         // TODO: latency?
-        // TODO: fee check?
     }
 
     // If we failed adding our very first hop then we don't need to unwrap any htlcs.
@@ -228,6 +254,9 @@ struct ChannelParticipant {
     max_in_flight: u64,
     local_balance: u64,
     in_flight: HashMap<PaymentHash, Htlc>,
+    cltv_expiry_delta: u32,
+    base_fee: u64,
+    fee_rate_prop: u64,
 }
 
 impl ChannelParticipant {
@@ -235,6 +264,20 @@ impl ChannelParticipant {
         self.in_flight
             .iter()
             .fold(0, |sum, val| sum + val.1.amount_msat)
+    }
+
+    fn check_forward(&self, cltv_delta: u32, amt: u64, fee: u64) -> Result<(), ()> {
+        if cltv_delta < self.cltv_expiry_delta {
+            return Err(());
+        }
+
+        let expected_fee =
+            self.base_fee as f64 + ((self.fee_rate_prop as f64 * amt as f64) / 1000000.0);
+        if (fee as f64) < expected_fee {
+            return Err(());
+        }
+
+        Ok(())
     }
 
     fn check_policy(&self, htlc: &Htlc) -> Result<(), ()> {
@@ -355,6 +398,24 @@ impl SimChannel {
             } else {
                 return Err(());
             }
+        }
+
+        Err(())
+    }
+
+    fn check_htlc_forward(
+        &self,
+        node: PublicKey,
+        cltv_delta: u32,
+        amount_msat: u64,
+        fee_msat: u64,
+    ) -> Result<(), ()> {
+        if node == self.node_1.id {
+            return self.node_1.check_forward(cltv_delta, amount_msat, fee_msat);
+        }
+
+        if node == self.node_2.id {
+            return self.node_2.check_forward(cltv_delta, amount_msat, fee_msat);
         }
 
         Err(())
