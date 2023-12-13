@@ -184,22 +184,22 @@ struct ChannelParticipant {
 }
 
 impl ChannelParticipant {
-    fn check_policy(
-        &self,
-        htlc: &HTLC,
-        balance: u64,
-        htlcs: &HashMap<PaymentHash, HTLC>,
-    ) -> Result<(), ()> {
-        if htlc.amount_msat > balance {
+    fn in_flight_total(&self) -> u64 {
+        self.in_flight
+            .iter()
+            .fold(0, |sum, val| sum + val.1.amount_msat)
+    }
+
+    fn check_policy(&self, htlc: &HTLC) -> Result<(), ()> {
+        if htlc.amount_msat > self.local_balance {
             return Err(());
         }
 
-        if htlcs.len() as u64 + 1 > self.max_htlc {
+        if self.in_flight.len() as u64 + 1 > self.max_htlc {
             return Err(());
         }
 
-        let in_flight_total = htlcs.iter().fold(0, |sum, val| sum + val.1.amount_msat);
-        if in_flight_total + htlc.amount_msat > self.max_in_flight {
+        if self.in_flight_total() + htlc.amount_msat > self.max_in_flight {
             return Err(());
         }
 
@@ -211,7 +211,7 @@ impl ChannelParticipant {
     }
 
     fn add_outgoing_htlc(&mut self, htlc: HTLC) -> Result<(), ()> {
-        self.check_policy(&htlc, self.local_balance, &self.in_flight)?;
+        self.check_policy(&htlc)?;
 
         match self.in_flight.get(&htlc.hash) {
             Some(_) => return Err(()),
@@ -245,15 +245,32 @@ impl SimChannel {
         }
 
         if node == self.node_1.id {
-            return self.node_1.add_outgoing_htlc(htlc);
+            let res = self.node_1.add_outgoing_htlc(htlc);
+            self.sanity_check();
+            return res;
         }
 
         if node == self.node_2.id {
-            return self.node_2.add_outgoing_htlc(htlc);
+            let res = self.node_2.add_outgoing_htlc(htlc);
+            self.sanity_check();
+            return res;
         }
 
-        // TODO: add sanity check that values add up.
         Err(())
+    }
+
+    /// performs a sanity check on the total balances in a channel. Note that we do not currently include on-chain
+    /// fees or reserve so these values should exactly match.
+    fn sanity_check(&self) {
+        let node_1_total = self.node_1.local_balance + self.node_1.in_flight_total();
+        let node_2_total = self.node_2.local_balance + self.node_2.in_flight_total();
+
+        if node_1_total + node_2_total != self.capacity_msat {
+            panic!(
+                "channel sanity check failed: total balance: {} != node_1: {} + node 2: {}",
+                self.capacity_msat, node_1_total, node_2_total
+            )
+        }
     }
 
     fn remove_htlc(
@@ -262,6 +279,7 @@ impl SimChannel {
         hash: PaymentHash,
         success: bool,
     ) -> Result<(), ()> {
+        // TODO: macro for this?
         if incoming_node == self.node_1.id {
             if let Ok(htlc) = self.node_1.remove_outgoing_htlc(hash, success) {
                 // If the HTLC was settled, its amount is transferred to the remote party's local balance.
@@ -269,6 +287,7 @@ impl SimChannel {
                 if success {
                     self.node_2.local_balance += htlc.amount_msat
                 }
+                self.sanity_check();
 
                 return Ok(());
             } else {
@@ -284,6 +303,7 @@ impl SimChannel {
                     self.node_1.local_balance += htlc.amount_msat
                 }
 
+                self.sanity_check();
                 return Ok(());
             } else {
                 return Err(());
