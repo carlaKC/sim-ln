@@ -6,6 +6,7 @@ use bitcoin::{secp256k1::PublicKey, Network};
 use lightning::ln::{PaymentHash, PaymentPreimage};
 use lightning::routing::router::Path;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::select;
 use tokio::sync::oneshot::{channel, Receiver, Sender};
@@ -151,7 +152,8 @@ async fn propagate_payment(
         }
 
         // Once we've taken the "hop" to the destination pubkey, it becomes the source of the next outgoing htlc.
-        outgoing_node = hop.pubkey;
+        let pubkey_str = format!("{}", hop.pubkey);
+        outgoing_node = PublicKey::from_str(&pubkey_str).unwrap();
         outgoing_amount -= hop.fee_msat;
         outgoing_cltv -= hop.cltv_expiry_delta;
 
@@ -176,7 +178,10 @@ async fn propagate_payment(
         let incoming_node = if i == 0 {
             source
         } else {
-            route.hops[i - 1].pubkey
+			// Note: this is a _hideous_ workaround for the fact that we're using a different
+			// version of bitcoin dep than LDK.
+            let pubkey_str = format!("{}", route.hops[i - 1].pubkey);
+            PublicKey::from_str(&pubkey_str).unwrap()
         };
 
         match nodes.lock().await.get_mut(&hop.short_channel_id) {
