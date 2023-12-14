@@ -5,12 +5,13 @@ use bitcoin::hashes::Hash;
 use bitcoin::{secp256k1::PublicKey, Network};
 use bitcoin_ldk::blockdata::constants::genesis_block;
 use bitcoin_ldk::BlockHash;
-use lightning::ln::features::ChannelFeatures;
+use lightning::ln::features::{ChannelFeatures, NodeFeatures};
 use lightning::ln::{msgs::UnsignedChannelAnnouncement, PaymentHash, PaymentPreimage};
 use lightning::routing::gossip::{ChannelInfo, ChannelUpdateInfo, NetworkGraph, NodeId};
 use lightning::routing::router::Path;
 use lightning::routing::utxo::{UtxoLookup, UtxoResult};
 use lightning::util::logger::{Logger, Record};
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::str::FromStr;
@@ -42,12 +43,36 @@ impl<L: Deref + std::marker::Send> Graph<L>
 where
     <L as Deref>::Target: Logger,
 {
-    fn new(graph: NetworkGraph<L>) -> Result<Self, ()> {
-        let mut nodes = HashMap::new();
+    pub fn new(graph: NetworkGraph<L>) -> Result<Self, ()> {
+        let mut nodes: HashMap<PublicKey, GraphEntry> = HashMap::new();
         let mut channels = HashMap::new();
 
         for (short_chan_id, channel) in graph.read_only().channels().unordered_iter() {
             channels.insert(*short_chan_id, SimChannel::from_ldk(channel)?);
+
+            macro_rules! insert_node_entry {
+                ($node:expr) => {{
+                    let pubkey = PublicKey::from_slice($node.as_slice()).map_err(|_| ())?;
+                    let capacity = channel.capacity_sats.ok_or(())? * 1000;
+
+                    match nodes.entry(pubkey) {
+                        Entry::Occupied(o) => o.into_mut().node_capacities.push(capacity),
+                        Entry::Vacant(v) => {
+                            v.insert(GraphEntry {
+                                node_info: NodeInfo {
+                                    pubkey,
+                                    alias: "".to_string(),
+                                    features: NodeFeatures::empty(), // TODO: simulation feature
+                                },
+                                node_capacities: vec![capacity],
+                            });
+                        }
+                    }
+                }};
+            }
+
+            insert_node_entry!(channel.node_one);
+            insert_node_entry!(channel.node_two);
         }
 
         Ok(Graph {
@@ -58,6 +83,7 @@ where
         })
     }
 }
+
 struct WrappedLog {}
 
 impl Logger for WrappedLog {
@@ -379,7 +405,7 @@ impl ChannelParticipant {
         capacity_msat: u64,
         initiator: bool,
     ) -> Result<Self, ()> {
-		// TODO: fix workaround with two different pubkey types
+        // TODO: fix workaround with two different pubkey types
         let pk = PublicKey::from_slice(node.as_slice()).map_err(|_| ())?;
 
         Ok(ChannelParticipant {
