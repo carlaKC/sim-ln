@@ -8,7 +8,7 @@ use bitcoin_ldk::BlockHash;
 use lightning::ln::features::{ChannelFeatures, NodeFeatures};
 use lightning::ln::{msgs::UnsignedChannelAnnouncement, PaymentHash, PaymentPreimage};
 use lightning::routing::gossip::{ChannelInfo, ChannelUpdateInfo, NetworkGraph, NodeId};
-use lightning::routing::router::Path;
+use lightning::routing::router::{find_route, Path, Payee, PaymentParameters, RouteParameters};
 use lightning::routing::utxo::{UtxoLookup, UtxoResult};
 use lightning::util::logger::{Logger, Record};
 use std::collections::hash_map::Entry;
@@ -174,6 +174,32 @@ where
     ) -> Receiver<Result<PaymentResult, LightningError>> {
         let (sender, receiver) = channel();
 
+        let path = find_route(
+            &ldk_pubkey(source),
+            &RouteParameters {
+                payment_params: PaymentParameters {
+                    payee: Payee::Clear {
+                        node_id: ldk_pubkey(dest),
+                        route_hints: Vec::new(),
+                        features: None,
+                        final_cltv_expiry_delta: 0,
+                    },
+                    expiry_time: None,
+                    max_total_cltv_expiry_delta: todo!(),
+                    max_path_count: 1, // TODO MPP?
+                    max_channel_saturation_power_of_half: 1, 
+                    previously_failed_channels: Vec::new(),
+                },
+                final_value_msat: amount_msat,
+                max_total_routing_fee_msat: None,
+            },
+            &self.graph,
+            None,
+            &WrappedLog {},
+            scorer, // need to set up scorer.
+            score_params,
+            &[0; 32],
+        );
         self.tasks.spawn(propagate_payment(
             self.channels.clone(),
             source,
@@ -656,4 +682,9 @@ impl<T: SimNetwork + Send + Sync> LightningNode for SimNode<T> {
             .await?
             .node_capacities)
     }
+}
+
+// workaround to get ldk types pubkeys
+fn ldk_pubkey(pk: PublicKey) -> bitcoin_ldk::secp256k1::PublicKey {
+    bitcoin_ldk::secp256k1::PublicKey::from_str(&pk.to_string()).unwrap()
 }
