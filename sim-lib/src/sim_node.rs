@@ -7,11 +7,12 @@ use bitcoin_ldk::blockdata::constants::genesis_block;
 use bitcoin_ldk::BlockHash;
 use lightning::ln::features::ChannelFeatures;
 use lightning::ln::{msgs::UnsignedChannelAnnouncement, PaymentHash, PaymentPreimage};
-use lightning::routing::gossip::{NetworkGraph, NodeId};
+use lightning::routing::gossip::{ChannelInfo, ChannelUpdateInfo, NetworkGraph, NodeId};
 use lightning::routing::router::Path;
 use lightning::routing::utxo::{UtxoLookup, UtxoResult};
 use lightning::util::logger::{Logger, Record};
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::select;
@@ -20,7 +21,10 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use triggered::Listener;
 
-pub struct Graph {
+pub struct Graph<L: Deref + std::marker::Send>
+where
+    L::Target: Logger,
+{
     // nodes maps the public key of a node to a vector of its currently open channels (scid), used for graph lookups.
     nodes: Arc<Mutex<HashMap<PublicKey, GraphEntry>>>,
 
@@ -29,8 +33,31 @@ pub struct Graph {
 
     // track all tasks spawned to process payments in the graph.
     tasks: JoinSet<()>,
+
+    // a network graph used for pathfinding.
+    graph: NetworkGraph<L>,
 }
 
+impl<L: Deref + std::marker::Send> Graph<L>
+where
+    <L as Deref>::Target: Logger,
+{
+    fn new(graph: NetworkGraph<L>) -> Result<Self, ()> {
+        let mut nodes = HashMap::new();
+        let mut channels = HashMap::new();
+
+        for (short_chan_id, channel) in graph.read_only().channels().unordered_iter() {
+            channels.insert(*short_chan_id, SimChannel::from_ldk(channel)?);
+        }
+
+        Ok(Graph {
+            nodes: Arc::new(Mutex::new(nodes)),
+            channels: Arc::new(Mutex::new(channels)),
+            tasks: JoinSet::new(),
+            graph,
+        })
+    }
+}
 struct WrappedLog {}
 
 impl Logger for WrappedLog {
@@ -106,7 +133,10 @@ trait SimNetwork {
 }
 
 #[async_trait]
-impl SimNetwork for Graph {
+impl<L: Deref + std::marker::Send + std::marker::Sync> SimNetwork for Graph<L>
+where
+    <L as Deref>::Target: Logger,
+{
     /// dispatch_payment asynchronously propagates a payment through the simulated network, returning a tracking
     /// channel that can be used to obtain the result of the payment.
     fn dispatch_payment(
@@ -309,6 +339,28 @@ struct SimChannel {
     capacity_msat: u64,
 }
 
+impl SimChannel {
+    fn from_ldk(info: &ChannelInfo) -> Result<Self, ()> {
+        let capacity_msat = info.capacity_sats.ok_or(())? * 1000;
+
+        Ok(SimChannel {
+            node_1: ChannelParticipant::from_ldk(
+                info.node_one,
+                info.one_to_two.clone().ok_or(())?,
+                capacity_msat,
+                true,
+            )?,
+            node_2: ChannelParticipant::from_ldk(
+                info.node_two,
+                info.two_to_one.clone().ok_or(())?,
+                capacity_msat,
+                false,
+            )?,
+            capacity_msat,
+        })
+    }
+}
+
 struct ChannelParticipant {
     id: PublicKey,
     max_htlc: u64,
@@ -321,6 +373,27 @@ struct ChannelParticipant {
 }
 
 impl ChannelParticipant {
+    fn from_ldk(
+        node: NodeId,
+        update: ChannelUpdateInfo,
+        capacity_msat: u64,
+        initiator: bool,
+    ) -> Result<Self, ()> {
+		// TODO: fix workaround with two different pubkey types
+        let pk = PublicKey::from_slice(node.as_slice()).map_err(|_| ())?;
+
+        Ok(ChannelParticipant {
+            id: pk,
+            max_htlc: 483, // TODO: infer from implementation?
+            max_in_flight: update.htlc_maximum_msat,
+            local_balance: if initiator { capacity_msat } else { 0 },
+            in_flight: HashMap::new(),
+            cltv_expiry_delta: update.cltv_expiry_delta as u32,
+            base_fee: update.fees.base_msat as u64,
+            fee_rate_prop: update.fees.proportional_millionths as u64,
+        })
+    }
+
     fn in_flight_total(&self) -> u64 {
         self.in_flight
             .iter()
