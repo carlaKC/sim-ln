@@ -3,8 +3,14 @@ use async_trait::async_trait;
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
 use bitcoin::{secp256k1::PublicKey, Network};
-use lightning::ln::{PaymentHash, PaymentPreimage};
+use bitcoin_ldk::blockdata::constants::genesis_block;
+use bitcoin_ldk::BlockHash;
+use lightning::ln::features::ChannelFeatures;
+use lightning::ln::{msgs::UnsignedChannelAnnouncement, PaymentHash, PaymentPreimage};
+use lightning::routing::gossip::{NetworkGraph, NodeId};
 use lightning::routing::router::Path;
+use lightning::routing::utxo::{UtxoLookup, UtxoResult};
+use lightning::util::logger::{Logger, Record};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -23,6 +29,61 @@ pub struct Graph {
 
     // track all tasks spawned to process payments in the graph.
     tasks: JoinSet<()>,
+}
+
+struct WrappedLog {}
+
+impl Logger for WrappedLog {
+    // TODO: better log, ideally just imported. Must have levels + formatted args.
+    fn log(&self, record: &Record) {
+        log::info!("{}", record.line)
+    }
+}
+
+// A mock utxo validator that we never use, we just need it for typing a none value.
+struct UtxoValidator {}
+
+impl UtxoLookup for UtxoValidator {
+    fn get_utxo(&self, _genesis_hash: &BlockHash, _short_channel_id: u64) -> UtxoResult {
+        unreachable!()
+    }
+}
+
+fn setup_graph(nodes: Vec<NodeInfo>) -> Result<(), ()> {
+    let graph = NetworkGraph::new(
+        // same issue of two different dependencies.
+        bitcoin_ldk::Network::Regtest,
+        &WrappedLog {},
+    );
+
+    // Add all the channels provided to our graph. This will also add the nodes to our network graph because ldk adds
+    // any missing nodes to its view.
+    for node in nodes {
+        let placeholder =
+            bitcoin_ldk::secp256k1::PublicKey::from_str(&node.pubkey.to_string()).unwrap();
+
+        let channel = UnsignedChannelAnnouncement {
+            features: ChannelFeatures::empty(),
+            chain_hash: genesis_block(bitcoin_ldk::Network::Regtest)
+                .header
+                .block_hash(),
+            short_channel_id: 0,
+            node_id_1: NodeId::from_pubkey(&placeholder),
+            node_id_2: NodeId::from_pubkey(&placeholder),
+            bitcoin_key_1: NodeId::from_pubkey(&placeholder),
+            bitcoin_key_2: NodeId::from_pubkey(&placeholder),
+            excess_data: Vec::new(),
+        };
+
+        if graph
+            .update_channel_from_unsigned_announcement::<&UtxoValidator>(&channel, &None)
+            .is_err()
+        {
+            return Err(());
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Clone)]
