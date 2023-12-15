@@ -77,6 +77,18 @@ impl Graph<'_> {
     }
 }
 
+pub async fn ln_node_from_graph(
+    graph: Arc<Mutex<Graph<'_>>>,
+) -> HashMap<PublicKey, Arc<Mutex<dyn LightningNode + Send + '_>>> {
+    let mut nodes: HashMap<PublicKey, Arc<Mutex<dyn LightningNode + Send>>> = HashMap::new();
+
+    for pk in graph.lock().await.nodes.keys() {
+        nodes.insert(*pk, Arc::new(Mutex::new(SimNode::new(*pk, graph.clone()))));
+    }
+
+    nodes
+}
+
 fn create_routing_graph(
     channels: Vec<SimChannel>,
 ) -> Result<NetworkGraph<&'static WrappedLog>, SimNodeError> {
@@ -150,20 +162,6 @@ fn create_routing_graph(
 
     Ok(graph)
 }
-
-/*pub async fn ln_node_from_graph(
-    graph: Arc<Mutex<Graph<'_>>>,
-) -> HashMap<PublicKey, Arc<Mutex<dyn LightningNode + Send>>> {
-    let mut nodes: HashMap<PublicKey, Arc<Mutex<dyn LightningNode + Send>>> = HashMap::new();
-    for (pk, _) in graph.lock().await.nodes.iter() {
-        nodes.insert(
-            *pk,
-            Arc::new(Mutex::new(SimNode::new(node_info(*pk), graph.clone()))),
-        );
-    }
-
-    nodes
-}*/
 
 /// Produces the node info for a mocked node, filling in the features that the simulator requires.
 fn node_info(pk: PublicKey) -> NodeInfo {
@@ -652,6 +650,8 @@ impl SimChannel {
     }
 }
 
+/// A wrapper struct used to implement the LightningNode trait (can be thought of as "the" lightning node). Passes
+/// all functionality through to a coordinating simulation network.
 struct SimNode<T: SimNetwork + Send + Sync> {
     info: NodeInfo,
     network: Arc<Mutex<T>>,
@@ -659,9 +659,9 @@ struct SimNode<T: SimNetwork + Send + Sync> {
 }
 
 impl<T: SimNetwork + Send + Sync> SimNode<T> {
-    pub fn new(info: NodeInfo, network: Arc<Mutex<T>>) -> Self {
+    pub fn new(pubkey: PublicKey, network: Arc<Mutex<T>>) -> Self {
         SimNode {
-            info,
+            info: node_info(pubkey),
             network,
             in_flight: HashMap::new(),
         }
