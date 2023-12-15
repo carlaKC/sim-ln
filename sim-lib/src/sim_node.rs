@@ -4,7 +4,7 @@ use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
 use bitcoin::{secp256k1::PublicKey, Network};
 use bitcoin_ldk::blockdata::constants::genesis_block;
-use bitcoin_ldk::blockdata::script::{Builder, Script};
+use bitcoin_ldk::blockdata::script::Script;
 use bitcoin_ldk::{BlockHash, TxOut};
 use lightning::ln::chan_utils::make_funding_redeemscript;
 use lightning::ln::features::{ChannelFeatures, NodeFeatures};
@@ -28,12 +28,13 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use triggered::Listener;
 
+/// Graph is the top level struct that is used to coordinate simulation of lightning nodes.
 pub struct Graph<L: Deref + std::marker::Send>
 where
     L::Target: Logger,
 {
-    // nodes maps the public key of a node to a vector of its currently open channels (scid), used for graph lookups.
-    nodes: Arc<Mutex<HashMap<PublicKey, GraphEntry>>>,
+    // nodes caches the list of nodes in the network with a vector of their channel capacities.
+    nodes: HashMap<PublicKey, Vec<u64>>,
 
     // channels maps the scid of a channel to its current state.
     channels: Arc<Mutex<HashMap<u64, SimChannel>>>,
@@ -53,7 +54,7 @@ where
     <L as Deref>::Target: Logger,
 {
     pub fn new(graph: NetworkGraph<L>, logger: L) -> Result<Self, ()> {
-        let mut nodes: HashMap<PublicKey, GraphEntry> = HashMap::new();
+        let mut nodes: HashMap<PublicKey, Vec<u64>> = HashMap::new();
         let mut channels = HashMap::new();
 
         for (short_chan_id, channel) in graph.read_only().channels().unordered_iter() {
@@ -65,16 +66,9 @@ where
                     let capacity = channel.capacity_sats.ok_or(())? * 1000;
 
                     match nodes.entry(pubkey) {
-                        Entry::Occupied(o) => o.into_mut().node_capacities.push(capacity),
+                        Entry::Occupied(o) => o.into_mut().push(capacity),
                         Entry::Vacant(v) => {
-                            v.insert(GraphEntry {
-                                node_info: NodeInfo {
-                                    pubkey,
-                                    alias: "".to_string(),
-                                    features: NodeFeatures::empty(), // TODO: simulation feature
-                                },
-                                node_capacities: vec![capacity],
-                            });
+                            v.insert(vec![capacity]);
                         }
                     }
                 }};
@@ -85,7 +79,7 @@ where
         }
 
         Ok(Graph {
-            nodes: Arc::new(Mutex::new(nodes)),
+            nodes,
             channels: Arc::new(Mutex::new(channels)),
             tasks: JoinSet::new(),
             graph,
@@ -101,17 +95,26 @@ where
     <L as Deref>::Target: Logger,
 {
     let mut nodes: HashMap<PublicKey, Arc<Mutex<dyn LightningNode + Send>>> = HashMap::new();
-    for (pk, node) in graph.lock().await.nodes.lock().await.iter() {
+    for (pk, _) in graph.lock().await.nodes.iter() {
         nodes.insert(
             *pk,
-            Arc::new(Mutex::new(SimNode::new(
-                node.node_info.clone(),
-                graph.clone(),
-            ))),
+            Arc::new(Mutex::new(SimNode::new(node_info(*pk), graph.clone()))),
         );
     }
 
     nodes
+}
+
+/// Produces the node info for a mocked node, filling in the features that the simulator requires.
+fn node_info(pk: PublicKey) -> NodeInfo {
+    let mut features = NodeFeatures::empty();
+    features.set_keysend_optional();
+
+    NodeInfo {
+        pubkey: pk,
+        alias: "".to_string(), // TODO: store alias?
+        features,
+    }
 }
 
 struct WrappedLog {}
@@ -194,7 +197,7 @@ where
         macro_rules! generate_and_update_channel {
             ($node:expr) => {{
                 let update = UnsignedChannelUpdate {
-                    chain_hash: chain_hash,
+                    chain_hash,
                     short_channel_id: channel.short_channel_id,
                     timestamp: 0,
                     flags: 0, // TODO: check flags
@@ -236,12 +239,6 @@ where
     Ok(graph)
 }
 
-#[derive(Clone)]
-struct GraphEntry {
-    node_info: NodeInfo,
-    node_capacities: Vec<u64>,
-}
-
 #[async_trait]
 trait SimNetwork {
     fn dispatch_payment(
@@ -252,7 +249,7 @@ trait SimNetwork {
         preimage: PaymentPreimage,
     ) -> Receiver<Result<PaymentResult, LightningError>>;
 
-    async fn lookup_node(&self, node: &PublicKey) -> Result<GraphEntry, LightningError>;
+    async fn lookup_node(&self, node: &PublicKey) -> Result<(NodeInfo, Vec<u64>), LightningError>;
 }
 
 #[async_trait]
@@ -334,10 +331,10 @@ where
         receiver
     }
 
-    /// lookup_node fetches a node's information from the graph.
-    async fn lookup_node(&self, node: &PublicKey) -> Result<GraphEntry, LightningError> {
-        match self.nodes.lock().await.get(node) {
-            Some(g) => Ok(g.clone()),
+    /// lookup_node fetches a node's information and channel capacities.
+    async fn lookup_node(&self, node: &PublicKey) -> Result<(NodeInfo, Vec<u64>), LightningError> {
+        match self.nodes.get(node) {
+            Some(channels) => Ok((node_info(*node), channels.clone())),
             None => Err(LightningError::GetNodeInfoError(
                 "Node not found".to_string(),
             )),
@@ -803,13 +800,7 @@ impl<T: SimNetwork + Send + Sync> LightningNode for SimNode<T> {
     }
 
     async fn get_node_info(&mut self, node_id: &PublicKey) -> Result<NodeInfo, LightningError> {
-        Ok(self
-            .network
-            .lock()
-            .await
-            .lookup_node(node_id)
-            .await?
-            .node_info)
+        Ok(self.network.lock().await.lookup_node(node_id).await?.0)
     }
 
     async fn list_channels(&mut self) -> Result<Vec<u64>, LightningError> {
@@ -819,7 +810,7 @@ impl<T: SimNetwork + Send + Sync> LightningNode for SimNode<T> {
             .await
             .lookup_node(&self.info.pubkey)
             .await?
-            .node_capacities)
+            .1)
     }
 }
 
