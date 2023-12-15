@@ -27,6 +27,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use triggered::Listener;
 
+#[derive(Debug)]
 pub enum SimNodeError {
     SetupError(String),
 }
@@ -64,8 +65,8 @@ impl Graph<'_> {
                 }};
             }
 
-            insert_node_entry!(channel.node_1.id);
-            insert_node_entry!(channel.node_2.id);
+            insert_node_entry!(channel.node_1.pubkey);
+            insert_node_entry!(channel.node_2.pubkey);
         }
 
         Ok(Graph {
@@ -102,8 +103,8 @@ fn create_routing_graph(
         .block_hash();
 
     for channel in channels {
-        let node_1_pk = ldk_pubkey(channel.node_1.id);
-        let node_2_pk = ldk_pubkey(channel.node_2.id);
+        let node_1_pk = ldk_pubkey(channel.node_1.pubkey);
+        let node_2_pk = ldk_pubkey(channel.node_2.pubkey);
 
         let announcement = UnsignedChannelAnnouncement {
             features: ChannelFeatures::empty(), // TODO: check whether we need any features (new onion?)
@@ -456,17 +457,15 @@ struct Htlc {
 
 #[derive(Clone)]
 pub struct SimChannel {
-    short_channel_id: u64,
-    node_1: ChannelParticipant,
-    node_2: ChannelParticipant,
-
-    // Total capacity of the channel expressed in msat.
-    capacity_msat: u64,
+    pub capacity_msat: u64,
+    pub short_channel_id: u64,
+    pub node_1: ChannelParticipant,
+    pub node_2: ChannelParticipant,
 }
 
 #[derive(Clone)]
 pub struct ChannelParticipant {
-    id: PublicKey,
+    pubkey: PublicKey,
     max_htlc_count: u64,
     max_in_flight: u64,
     min_htlc_size: u64,
@@ -479,6 +478,32 @@ pub struct ChannelParticipant {
 }
 
 impl ChannelParticipant {
+    pub fn new(
+        pubkey: PublicKey,
+        max_htlc_count: u64,
+        max_in_flight: u64,
+        min_htlc_size: u64,
+        max_htlc_size: u64,
+        cltv_expiry_delta: u32,
+        base_fee: u64,
+        fee_rate_prop: u64,
+        initiator: bool,
+        capacity: u64,
+    ) -> Self {
+        ChannelParticipant {
+            pubkey,
+            max_htlc_count,
+            max_in_flight,
+            min_htlc_size,
+            max_htlc_size,
+            local_balance: if initiator { capacity } else { 0 },
+            in_flight: HashMap::new(),
+            cltv_expiry_delta,
+            base_fee,
+            fee_rate_prop,
+        }
+    }
+
     fn in_flight_total(&self) -> u64 {
         self.in_flight
             .iter()
@@ -562,13 +587,13 @@ impl SimChannel {
             return Err(());
         }
 
-        if node == self.node_1.id {
+        if node == self.node_1.pubkey {
             let res = self.node_1.add_outgoing_htlc(htlc);
             self.sanity_check();
             return res;
         }
 
-        if node == self.node_2.id {
+        if node == self.node_2.pubkey {
             let res = self.node_2.add_outgoing_htlc(htlc);
             self.sanity_check();
             return res;
@@ -598,7 +623,7 @@ impl SimChannel {
         success: bool,
     ) -> Result<(), ()> {
         // TODO: macro for this?
-        if incoming_node == self.node_1.id {
+        if incoming_node == self.node_1.pubkey {
             if let Ok(htlc) = self.node_1.remove_outgoing_htlc(hash, success) {
                 // If the HTLC was settled, its amount is transferred to the remote party's local balance.
                 // If it was failed, the above removal has already dealt with balance management.
@@ -613,7 +638,7 @@ impl SimChannel {
             }
         }
 
-        if incoming_node == self.node_2.id {
+        if incoming_node == self.node_2.pubkey {
             if let Ok(htlc) = self.node_2.remove_outgoing_htlc(hash, success) {
                 // If the HTLC was settled, its amount is transferred to the remote party's local balance.
                 // If it was failed, the above removal has already dealt with balance management.
@@ -638,11 +663,11 @@ impl SimChannel {
         amount_msat: u64,
         fee_msat: u64,
     ) -> Result<(), ()> {
-        if node == self.node_1.id {
+        if node == self.node_1.pubkey {
             return self.node_1.check_forward(cltv_delta, amount_msat, fee_msat);
         }
 
-        if node == self.node_2.id {
+        if node == self.node_2.pubkey {
             return self.node_2.check_forward(cltv_delta, amount_msat, fee_msat);
         }
 
