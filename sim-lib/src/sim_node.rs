@@ -4,8 +4,11 @@ use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
 use bitcoin::{secp256k1::PublicKey, Network};
 use bitcoin_ldk::blockdata::constants::genesis_block;
-use bitcoin_ldk::BlockHash;
+use bitcoin_ldk::blockdata::script::{Builder, Script};
+use bitcoin_ldk::{BlockHash, TxOut};
+use lightning::ln::chan_utils::make_funding_redeemscript;
 use lightning::ln::features::{ChannelFeatures, NodeFeatures};
+use lightning::ln::msgs::UnsignedChannelUpdate;
 use lightning::ln::{msgs::UnsignedChannelAnnouncement, PaymentHash, PaymentPreimage};
 use lightning::routing::gossip::{ChannelInfo, ChannelUpdateInfo, NetworkGraph, NodeId};
 use lightning::routing::router::{find_route, Path, Payee, PaymentParameters, RouteParameters};
@@ -91,7 +94,7 @@ where
     }
 }
 
-pub async fn ln_node_from_graph<L: Deref + Send + Sync + Copy +'static>(
+pub async fn ln_node_from_graph<L: Deref + Send + Sync + Copy + 'static>(
     graph: Arc<Mutex<Graph<L>>>,
 ) -> HashMap<PublicKey, Arc<Mutex<dyn LightningNode + Send>>>
 where
@@ -120,50 +123,117 @@ impl Logger for WrappedLog {
     }
 }
 
-// A mock utxo validator that we never use, we just need it for typing a none value.
-struct UtxoValidator {}
+// UtxoValidator is a faked utxo validator that just returns a fake output with the desired
+// capacity for a channel.
+struct UtxoValidator {
+    amount: u64,
+    script: Script,
+}
 
 impl UtxoLookup for UtxoValidator {
     fn get_utxo(&self, _genesis_hash: &BlockHash, _short_channel_id: u64) -> UtxoResult {
-        unreachable!()
+        UtxoResult::Sync(Ok(TxOut {
+            value: self.amount,
+            script_pubkey: self.script.clone(),
+        }))
     }
 }
 
-fn setup_graph(nodes: Vec<NodeInfo>) -> Result<(), ()> {
-    let graph = NetworkGraph::new(
-        // same issue of two different dependencies.
-        bitcoin_ldk::Network::Regtest,
-        &WrappedLog {},
-    );
+pub struct ChannelDescription {
+    node_1: ChannelParticipant,
+    node_2: ChannelParticipant,
+    features: ChannelFeatures,
+    short_channel_id: u64,
+    capacity: u64,
+}
+
+fn setup_graph<L: Deref>(
+    channels: Vec<ChannelDescription>,
+    logger: L,
+) -> Result<NetworkGraph<L>, ()>
+where
+    <L as Deref>::Target: Logger,
+{
+    let graph = NetworkGraph::new(bitcoin_ldk::Network::Regtest, logger);
 
     // Add all the channels provided to our graph. This will also add the nodes to our network graph because ldk adds
     // any missing nodes to its view.
-    for node in nodes {
-        let placeholder =
-            bitcoin_ldk::secp256k1::PublicKey::from_str(&node.pubkey.to_string()).unwrap();
+    let chain_hash = genesis_block(bitcoin_ldk::Network::Regtest)
+        .header
+        .block_hash();
 
-        let channel = UnsignedChannelAnnouncement {
-            features: ChannelFeatures::empty(),
-            chain_hash: genesis_block(bitcoin_ldk::Network::Regtest)
-                .header
-                .block_hash(),
-            short_channel_id: 0,
-            node_id_1: NodeId::from_pubkey(&placeholder),
-            node_id_2: NodeId::from_pubkey(&placeholder),
-            bitcoin_key_1: NodeId::from_pubkey(&placeholder),
-            bitcoin_key_2: NodeId::from_pubkey(&placeholder),
+    for channel in channels {
+        let node_1_pk = ldk_pubkey(channel.node_1.id);
+        let node_2_pk = ldk_pubkey(channel.node_2.id);
+
+        let announcement = UnsignedChannelAnnouncement {
+            features: channel.features,
+            chain_hash,
+            short_channel_id: channel.short_channel_id,
+            node_id_1: NodeId::from_pubkey(&node_1_pk),
+            node_id_2: NodeId::from_pubkey(&node_2_pk),
+            // Note: we don't need bitcoin keys for our purposes, so we just copy them *but* remember that we do use
+            // this for our fake utxo validation so they do matter.
+            bitcoin_key_1: NodeId::from_pubkey(&node_1_pk),
+            bitcoin_key_2: NodeId::from_pubkey(&node_2_pk),
             excess_data: Vec::new(),
         };
 
+        let utxo_validator = UtxoValidator {
+            amount: channel.capacity,
+            script: make_funding_redeemscript(&node_1_pk, &node_2_pk).to_v0_p2wsh(),
+        };
+
         if graph
-            .update_channel_from_unsigned_announcement::<&UtxoValidator>(&channel, &None)
+            .update_channel_from_unsigned_announcement(&announcement, &Some(&utxo_validator))
             .is_err()
         {
             return Err(());
         }
+
+        macro_rules! generate_and_update_channel {
+            ($node:expr) => {{
+                let update = UnsignedChannelUpdate {
+                    chain_hash: chain_hash,
+                    short_channel_id: channel.short_channel_id,
+                    timestamp: 0,
+                    flags: 0, // TODO: check flags
+                    cltv_expiry_delta: $node.cltv_expiry_delta as u16,
+                    htlc_minimum_msat: 0,
+                    htlc_maximum_msat: 1000, // TODO: actual amount!
+                    fee_base_msat: $node.base_fee as u32,
+                    fee_proportional_millionths: $node.fee_rate_prop as u32,
+                    excess_data: Vec::new(),
+                };
+
+                if graph.update_channel_unsigned(&update).is_err() {
+                    return Err(());
+                }
+            }};
+        }
+
+        generate_and_update_channel!(channel.node_1);
+        generate_and_update_channel!(channel.node_2);
+
+        let update_1 = UnsignedChannelUpdate {
+            chain_hash,
+            short_channel_id: channel.short_channel_id,
+            timestamp: 0,
+            flags: 0, // TODO: check flags
+            cltv_expiry_delta: channel.node_1.cltv_expiry_delta as u16,
+            htlc_minimum_msat: 0,
+            htlc_maximum_msat: 1000, // TODO: actual amount!
+            fee_base_msat: channel.node_1.base_fee as u32,
+            fee_proportional_millionths: channel.node_1.fee_rate_prop as u32,
+            excess_data: Vec::new(),
+        };
+
+        if graph.update_channel_unsigned(&update_1).is_err() {
+            return Err(());
+        }
     }
 
-    Ok(())
+    Ok(graph)
 }
 
 #[derive(Clone)]
@@ -459,10 +529,11 @@ impl SimChannel {
     }
 }
 
-struct ChannelParticipant {
+pub struct ChannelParticipant {
     id: PublicKey,
-    max_htlc: u64,
+    max_htlc_count: u64,
     max_in_flight: u64,
+    // TODO: max htlc size and min htlc size
     local_balance: u64,
     in_flight: HashMap<PaymentHash, Htlc>,
     cltv_expiry_delta: u32,
@@ -482,7 +553,7 @@ impl ChannelParticipant {
 
         Ok(ChannelParticipant {
             id: pk,
-            max_htlc: 483, // TODO: infer from implementation?
+            max_htlc_count: 483, // TODO: infer from implementation?
             max_in_flight: update.htlc_maximum_msat,
             local_balance: if initiator { capacity_msat } else { 0 },
             in_flight: HashMap::new(),
@@ -513,11 +584,12 @@ impl ChannelParticipant {
     }
 
     fn check_policy(&self, htlc: &Htlc) -> Result<(), ()> {
+        // TODO: max htlc size and min htlc size
         if htlc.amount_msat > self.local_balance {
             return Err(());
         }
 
-        if self.in_flight.len() as u64 + 1 > self.max_htlc {
+        if self.in_flight.len() as u64 + 1 > self.max_htlc_count {
             return Err(());
         }
 
