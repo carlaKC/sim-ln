@@ -45,7 +45,7 @@ where
     logger: L,
 }
 
-impl<L: Deref + std::marker::Send> Graph<L>
+impl<L: Deref + Send + Sync + Copy + 'static> Graph<L>
 where
     <L as Deref>::Target: Logger,
 {
@@ -89,6 +89,26 @@ where
             logger,
         })
     }
+}
+
+pub async fn ln_node_from_graph<L: Deref + Send + Sync + Copy +'static>(
+    graph: Arc<Mutex<Graph<L>>>,
+) -> HashMap<PublicKey, Arc<Mutex<dyn LightningNode + Send>>>
+where
+    <L as Deref>::Target: Logger,
+{
+    let mut nodes: HashMap<PublicKey, Arc<Mutex<dyn LightningNode + Send>>> = HashMap::new();
+    for (pk, node) in graph.lock().await.nodes.lock().await.iter() {
+        nodes.insert(
+            *pk,
+            Arc::new(Mutex::new(SimNode::new(
+                node.node_info.clone(),
+                graph.clone(),
+            ))),
+        );
+    }
+
+    nodes
 }
 
 struct WrappedLog {}
@@ -235,7 +255,7 @@ where
             self.channels.clone(),
             source,
             dest,
-			path.clone(),
+            path.clone(),
             amount_msat,
             preimage,
             sender,
@@ -636,8 +656,18 @@ impl SimChannel {
 
 struct SimNode<T: SimNetwork + Send + Sync> {
     info: NodeInfo,
-    network: T,
+    network: Arc<Mutex<T>>,
     in_flight: HashMap<PaymentHash, Receiver<Result<PaymentResult, LightningError>>>,
+}
+
+impl<T: SimNetwork + Send + Sync> SimNode<T> {
+    pub fn new(info: NodeInfo, network: Arc<Mutex<T>>) -> Self {
+        SimNode {
+            info,
+            network,
+            in_flight: HashMap::new(),
+        }
+    }
 }
 
 #[async_trait]
@@ -658,9 +688,12 @@ impl<T: SimNetwork + Send + Sync> LightningNode for SimNode<T> {
         amount_msat: u64,
     ) -> Result<PaymentHash, LightningError> {
         let preimage = PaymentPreimage(rand::random());
-        let payment_receiver =
-            self.network
-                .dispatch_payment(self.info.pubkey, dest, amount_msat, preimage);
+        let payment_receiver = self.network.lock().await.dispatch_payment(
+            self.info.pubkey,
+            dest,
+            amount_msat,
+            preimage,
+        );
 
         let preimage_bytes = Sha256::hash(&preimage.0[..]).to_byte_array();
         let payment_hash = PaymentHash(preimage_bytes);
@@ -698,12 +731,20 @@ impl<T: SimNetwork + Send + Sync> LightningNode for SimNode<T> {
     }
 
     async fn get_node_info(&mut self, node_id: &PublicKey) -> Result<NodeInfo, LightningError> {
-        Ok(self.network.lookup_node(node_id).await?.node_info)
+        Ok(self
+            .network
+            .lock()
+            .await
+            .lookup_node(node_id)
+            .await?
+            .node_info)
     }
 
     async fn list_channels(&mut self) -> Result<Vec<u64>, LightningError> {
         Ok(self
             .network
+            .lock()
+            .await
             .lookup_node(&self.info.pubkey)
             .await?
             .node_capacities)
