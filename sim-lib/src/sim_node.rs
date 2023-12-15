@@ -16,7 +16,7 @@ use lightning::routing::scoring::{
     ProbabilisticScorer, ProbabilisticScoringDecayParameters, ProbabilisticScoringFeeParameters,
 };
 use lightning::routing::utxo::{UtxoLookup, UtxoResult};
-use lightning::util::logger::{Logger, Record};
+use lightning::util::logger::{Level, Logger, Record};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -139,7 +139,7 @@ fn create_routing_graph(
                     chain_hash,
                     short_channel_id: channel.short_channel_id,
                     timestamp: 1702667117, // TODO: current time
-                    flags: $flags, // TODO: double check
+                    flags: $flags,         // TODO: double check
                     cltv_expiry_delta: $node.cltv_expiry_delta as u16,
                     htlc_minimum_msat: $node.min_htlc_size,
                     htlc_maximum_msat: $node.max_htlc_size,
@@ -181,7 +181,14 @@ struct WrappedLog {}
 impl Logger for WrappedLog {
     // TODO: better log, ideally just imported. Must have levels + formatted args.
     fn log(&self, record: &Record) {
-        log::info!("{}", record.line)
+        match record.level {
+            Level::Trace => log::trace!("{}", record.args),
+            Level::Debug => log::debug!("{}", record.args),
+            Level::Info => log::info!("{}", record.args),
+            Level::Warn => log::warn!("{}", record.args),
+            Level::Error => log::error!("{}", record.args),
+            _ => log::trace!("{}", record.args),
+        }
     }
 }
 
