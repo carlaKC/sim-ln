@@ -1,6 +1,8 @@
 use bitcoin::secp256k1::PublicKey;
+use sim_lib::sim_node::{ln_node_from_graph, ChannelParticipant, Graph, SimChannel};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -179,8 +181,49 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    let capacity = 300000000;
+    let pubkey_1 =
+        PublicKey::from_str("039ae6b91fbec1b400adffcd7f7132e81efbb5aaeeeb061903695a919652aee761")?;
+    let node_1 = ChannelParticipant::new(
+        pubkey_1,
+        483,
+        capacity / 2,
+        1,
+        capacity / 2,
+        40,
+        1000,
+        1,
+        true,
+        capacity,
+    );
+
+    let pubkey_2 =
+        PublicKey::from_str("0275ade20b15f2a309d8db2d7ea4f5004129204b83d2307433292f183bdbe5df2e")?;
+    let node_2 = ChannelParticipant::new(
+        pubkey_2,
+        483,
+        capacity / 2,
+        1,
+        capacity / 2,
+        40,
+        1000,
+        1,
+        false,
+        capacity,
+    );
+
+    let graph = match Graph::new(vec![SimChannel {
+        capacity_msat: capacity,
+        short_channel_id: 123,
+        node_1,
+        node_2,
+    }]) {
+        Ok(graph) => Arc::new(Mutex::new(graph)),
+        Err(e) => anyhow::bail!("failed: {:?}", e),
+    };
+
     let sim = Simulation::new(
-        clients,
+        ln_node_from_graph(graph).await,
         validated_activities,
         cli.total_time,
         cli.print_batch_size,
