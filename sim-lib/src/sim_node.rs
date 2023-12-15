@@ -138,7 +138,7 @@ fn create_routing_graph(
                 let update = UnsignedChannelUpdate {
                     chain_hash,
                     short_channel_id: channel.short_channel_id,
-                    timestamp: 0,
+                    timestamp: 1702667117, // TODO: current time
                     flags: $flags, // TODO: double check
                     cltv_expiry_delta: $node.cltv_expiry_delta as u16,
                     htlc_minimum_msat: $node.min_htlc_size,
