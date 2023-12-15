@@ -9,6 +9,9 @@ use lightning::ln::features::{ChannelFeatures, NodeFeatures};
 use lightning::ln::{msgs::UnsignedChannelAnnouncement, PaymentHash, PaymentPreimage};
 use lightning::routing::gossip::{ChannelInfo, ChannelUpdateInfo, NetworkGraph, NodeId};
 use lightning::routing::router::{find_route, Path, Payee, PaymentParameters, RouteParameters};
+use lightning::routing::scoring::{
+    ProbabilisticScorer, ProbabilisticScoringDecayParameters, ProbabilisticScoringFeeParameters,
+};
 use lightning::routing::utxo::{UtxoLookup, UtxoResult};
 use lightning::util::logger::{Logger, Record};
 use std::collections::hash_map::Entry;
@@ -37,13 +40,16 @@ where
 
     // a network graph used for pathfinding.
     graph: NetworkGraph<L>,
+
+    // A generic logger, just wrapping our existing log functionality (badly).
+    logger: L,
 }
 
 impl<L: Deref + std::marker::Send> Graph<L>
 where
     <L as Deref>::Target: Logger,
 {
-    pub fn new(graph: NetworkGraph<L>) -> Result<Self, ()> {
+    pub fn new(graph: NetworkGraph<L>, logger: L) -> Result<Self, ()> {
         let mut nodes: HashMap<PublicKey, GraphEntry> = HashMap::new();
         let mut channels = HashMap::new();
 
@@ -80,6 +86,7 @@ where
             channels: Arc::new(Mutex::new(channels)),
             tasks: JoinSet::new(),
             graph,
+            logger,
         })
     }
 }
@@ -159,7 +166,7 @@ trait SimNetwork {
 }
 
 #[async_trait]
-impl<L: Deref + std::marker::Send + std::marker::Sync> SimNetwork for Graph<L>
+impl<L: Deref + std::marker::Send + std::marker::Sync + Copy> SimNetwork for Graph<L>
 where
     <L as Deref>::Target: Logger,
 {
@@ -174,7 +181,10 @@ where
     ) -> Receiver<Result<PaymentResult, LightningError>> {
         let (sender, receiver) = channel();
 
-        let path = find_route(
+        let params = ProbabilisticScoringDecayParameters::default();
+        let scorer = ProbabilisticScorer::new(params, &self.graph, self.logger);
+
+        let route = match find_route(
             &ldk_pubkey(source),
             &RouteParameters {
                 payment_params: PaymentParameters {
@@ -185,9 +195,9 @@ where
                         final_cltv_expiry_delta: 0,
                     },
                     expiry_time: None,
-                    max_total_cltv_expiry_delta: todo!(),
-                    max_path_count: 1, // TODO MPP?
-                    max_channel_saturation_power_of_half: 1, 
+                    max_total_cltv_expiry_delta: 100000, // TODO real number
+                    max_path_count: 1,                   // TODO MPP?
+                    max_channel_saturation_power_of_half: 1,
                     previously_failed_channels: Vec::new(),
                 },
                 final_value_msat: amount_msat,
@@ -196,14 +206,36 @@ where
             &self.graph,
             None,
             &WrappedLog {},
-            scorer, // need to set up scorer.
-            score_params,
+            &scorer,
+            &ProbabilisticScoringFeeParameters::default(),
             &[0; 32],
-        );
+        ) {
+            Ok(path) => path,
+            Err(e) => {
+                // TODO: can we send a erro without blocking?
+                // TODO: what if the send on the channel errors? log
+                let _ = sender.send(Err(LightningError::SendPaymentError(format!(
+                    "no route: {:?}",
+                    e
+                ))));
+                return receiver;
+            }
+        };
+
+        let path = match route.paths.first() {
+            Some(p) => p,
+            None => {
+                let _ = sender.send(Err(LightningError::SendPaymentError(
+                    "route did not return any paths".to_string(),
+                )));
+                return receiver;
+            }
+        };
         self.tasks.spawn(propagate_payment(
             self.channels.clone(),
             source,
             dest,
+			path.clone(),
             amount_msat,
             preimage,
             sender,
@@ -227,17 +259,11 @@ async fn propagate_payment(
     nodes: Arc<Mutex<HashMap<u64, SimChannel>>>,
     source: PublicKey,
     dest: PublicKey,
+    route: Path,
     amount_msat: u64,
     preimage: PaymentPreimage,
     sender: Sender<Result<PaymentResult, LightningError>>,
 ) {
-    // TODO: pathfinding for actual route in the network.
-    let route = Path {
-        hops: vec![],
-        blinded_tail: None,
-    };
-
-    // Get values for the first HTLC we'll send from the source node.
     let mut outgoing_node = source;
     let mut outgoing_amount = route.fee_msat() + route.final_value_msat();
     let mut outgoing_cltv = route
