@@ -10,7 +10,7 @@ use lightning::ln::chan_utils::make_funding_redeemscript;
 use lightning::ln::features::{ChannelFeatures, NodeFeatures};
 use lightning::ln::msgs::UnsignedChannelUpdate;
 use lightning::ln::{msgs::UnsignedChannelAnnouncement, PaymentHash, PaymentPreimage};
-use lightning::routing::gossip::{ChannelInfo, ChannelUpdateInfo, NetworkGraph, NodeId};
+use lightning::routing::gossip::{NetworkGraph, NodeId};
 use lightning::routing::router::{find_route, Path, Payee, PaymentParameters, RouteParameters};
 use lightning::routing::scoring::{
     ProbabilisticScorer, ProbabilisticScoringDecayParameters, ProbabilisticScoringFeeParameters,
@@ -19,7 +19,6 @@ use lightning::routing::utxo::{UtxoLookup, UtxoResult};
 use lightning::util::logger::{Logger, Record};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::select;
@@ -28,11 +27,11 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use triggered::Listener;
 
+pub enum SimNodeError {
+    SetupError(String),
+}
 /// Graph is the top level struct that is used to coordinate simulation of lightning nodes.
-pub struct Graph<L: Deref + std::marker::Send>
-where
-    L::Target: Logger,
-{
+pub struct Graph<'a> {
     // nodes caches the list of nodes in the network with a vector of their channel capacities.
     nodes: HashMap<PublicKey, Vec<u64>>,
 
@@ -43,57 +42,118 @@ where
     tasks: JoinSet<()>,
 
     // a network graph used for pathfinding.
-    graph: NetworkGraph<L>,
-
-    // A generic logger, just wrapping our existing log functionality (badly).
-    logger: L,
+    graph: NetworkGraph<&'a WrappedLog>,
 }
 
-impl<L: Deref + Send + Sync + Copy + 'static> Graph<L>
-where
-    <L as Deref>::Target: Logger,
-{
-    pub fn new(graph: NetworkGraph<L>, logger: L) -> Result<Self, ()> {
+impl Graph<'_> {
+    pub fn new(graph_channels: Vec<SimChannel>) -> Result<Self, SimNodeError> {
         let mut nodes: HashMap<PublicKey, Vec<u64>> = HashMap::new();
         let mut channels = HashMap::new();
 
-        for (short_chan_id, channel) in graph.read_only().channels().unordered_iter() {
-            channels.insert(*short_chan_id, SimChannel::from_ldk(channel)?);
+        for channel in graph_channels.iter() {
+            channels.insert(channel.short_channel_id, channel.clone());
 
             macro_rules! insert_node_entry {
-                ($node:expr) => {{
-                    let pubkey = PublicKey::from_slice($node.as_slice()).map_err(|_| ())?;
-                    let capacity = channel.capacity_sats.ok_or(())? * 1000;
-
-                    match nodes.entry(pubkey) {
-                        Entry::Occupied(o) => o.into_mut().push(capacity),
+                ($pubkey:expr) => {{
+                    match nodes.entry($pubkey) {
+                        Entry::Occupied(o) => o.into_mut().push(channel.capacity_msat),
                         Entry::Vacant(v) => {
-                            v.insert(vec![capacity]);
+                            v.insert(vec![channel.capacity_msat]);
                         }
                     }
                 }};
             }
 
-            insert_node_entry!(channel.node_one);
-            insert_node_entry!(channel.node_two);
+            insert_node_entry!(channel.node_1.id);
+            insert_node_entry!(channel.node_2.id);
         }
 
         Ok(Graph {
             nodes,
             channels: Arc::new(Mutex::new(channels)),
             tasks: JoinSet::new(),
-            graph,
-            logger,
+            graph: create_routing_graph(graph_channels)?,
         })
     }
 }
 
-pub async fn ln_node_from_graph<L: Deref + Send + Sync + Copy + 'static>(
-    graph: Arc<Mutex<Graph<L>>>,
-) -> HashMap<PublicKey, Arc<Mutex<dyn LightningNode + Send>>>
-where
-    <L as Deref>::Target: Logger,
-{
+fn create_routing_graph(
+    channels: Vec<SimChannel>,
+) -> Result<NetworkGraph<&'static WrappedLog>, SimNodeError> {
+    let graph = NetworkGraph::new(bitcoin_ldk::Network::Regtest, &WrappedLog {});
+
+    // Add all the channels provided to our graph. This will also add the nodes to our network graph because ldk adds
+    // any missing nodes to its view. Note that the graph will not have "node level" information, such as supported
+    // features because we are not providing it with individual node announcements.
+    let chain_hash = genesis_block(bitcoin_ldk::Network::Regtest)
+        .header
+        .block_hash();
+
+    for channel in channels {
+        let node_1_pk = ldk_pubkey(channel.node_1.id);
+        let node_2_pk = ldk_pubkey(channel.node_2.id);
+
+        let announcement = UnsignedChannelAnnouncement {
+            features: ChannelFeatures::empty(), // TODO: check whether we need any features (new onion?)
+            chain_hash,
+            short_channel_id: channel.short_channel_id,
+            node_id_1: NodeId::from_pubkey(&node_1_pk),
+            node_id_2: NodeId::from_pubkey(&node_2_pk),
+            // Note: we don't need bitcoin keys for our purposes, so we just copy them *but* remember that we do use
+            // this for our fake utxo validation so they do matter.
+            bitcoin_key_1: NodeId::from_pubkey(&node_1_pk),
+            bitcoin_key_2: NodeId::from_pubkey(&node_2_pk),
+            excess_data: Vec::new(),
+        };
+
+        let utxo_validator = UtxoValidator {
+            amount: channel.capacity_msat,
+            script: make_funding_redeemscript(&node_1_pk, &node_2_pk).to_v0_p2wsh(),
+        };
+
+        if let Err(e) =
+            graph.update_channel_from_unsigned_announcement(&announcement, &Some(&utxo_validator))
+        {
+            return Err(SimNodeError::SetupError(format!(
+                "could not add channel announcement: {:?}",
+                e
+            )));
+        }
+
+        macro_rules! generate_and_update_channel {
+            ($node:expr, $flags:expr) => {{
+                let update = UnsignedChannelUpdate {
+                    chain_hash,
+                    short_channel_id: channel.short_channel_id,
+                    timestamp: 0,
+                    flags: $flags, // TODO: double check
+                    cltv_expiry_delta: $node.cltv_expiry_delta as u16,
+                    htlc_minimum_msat: $node.min_htlc_size,
+                    htlc_maximum_msat: $node.max_htlc_size,
+                    fee_base_msat: $node.base_fee as u32,
+                    fee_proportional_millionths: $node.fee_rate_prop as u32,
+                    excess_data: Vec::new(),
+                };
+
+                if let Err(e) = graph.update_channel_unsigned(&update) {
+                    return Err(SimNodeError::SetupError(format!(
+                        "could not add channel update: {:?}",
+                        e
+                    )));
+                }
+            }};
+        }
+
+        generate_and_update_channel!(channel.node_1, 1);
+        generate_and_update_channel!(channel.node_2, 0);
+    }
+
+    Ok(graph)
+}
+
+/*pub async fn ln_node_from_graph(
+    graph: Arc<Mutex<Graph<'_>>>,
+) -> HashMap<PublicKey, Arc<Mutex<dyn LightningNode + Send>>> {
     let mut nodes: HashMap<PublicKey, Arc<Mutex<dyn LightningNode + Send>>> = HashMap::new();
     for (pk, _) in graph.lock().await.nodes.iter() {
         nodes.insert(
@@ -103,7 +163,7 @@ where
     }
 
     nodes
-}
+}*/
 
 /// Produces the node info for a mocked node, filling in the features that the simulator requires.
 fn node_info(pk: PublicKey) -> NodeInfo {
@@ -142,103 +202,6 @@ impl UtxoLookup for UtxoValidator {
     }
 }
 
-pub struct ChannelDescription {
-    node_1: ChannelParticipant,
-    node_2: ChannelParticipant,
-    features: ChannelFeatures,
-    short_channel_id: u64,
-    capacity: u64,
-}
-
-fn setup_graph<L: Deref>(
-    channels: Vec<ChannelDescription>,
-    logger: L,
-) -> Result<NetworkGraph<L>, ()>
-where
-    <L as Deref>::Target: Logger,
-{
-    let graph = NetworkGraph::new(bitcoin_ldk::Network::Regtest, logger);
-
-    // Add all the channels provided to our graph. This will also add the nodes to our network graph because ldk adds
-    // any missing nodes to its view.
-    let chain_hash = genesis_block(bitcoin_ldk::Network::Regtest)
-        .header
-        .block_hash();
-
-    for channel in channels {
-        let node_1_pk = ldk_pubkey(channel.node_1.id);
-        let node_2_pk = ldk_pubkey(channel.node_2.id);
-
-        let announcement = UnsignedChannelAnnouncement {
-            features: channel.features,
-            chain_hash,
-            short_channel_id: channel.short_channel_id,
-            node_id_1: NodeId::from_pubkey(&node_1_pk),
-            node_id_2: NodeId::from_pubkey(&node_2_pk),
-            // Note: we don't need bitcoin keys for our purposes, so we just copy them *but* remember that we do use
-            // this for our fake utxo validation so they do matter.
-            bitcoin_key_1: NodeId::from_pubkey(&node_1_pk),
-            bitcoin_key_2: NodeId::from_pubkey(&node_2_pk),
-            excess_data: Vec::new(),
-        };
-
-        let utxo_validator = UtxoValidator {
-            amount: channel.capacity,
-            script: make_funding_redeemscript(&node_1_pk, &node_2_pk).to_v0_p2wsh(),
-        };
-
-        if graph
-            .update_channel_from_unsigned_announcement(&announcement, &Some(&utxo_validator))
-            .is_err()
-        {
-            return Err(());
-        }
-
-        macro_rules! generate_and_update_channel {
-            ($node:expr) => {{
-                let update = UnsignedChannelUpdate {
-                    chain_hash,
-                    short_channel_id: channel.short_channel_id,
-                    timestamp: 0,
-                    flags: 0, // TODO: check flags
-                    cltv_expiry_delta: $node.cltv_expiry_delta as u16,
-                    htlc_minimum_msat: 0,
-                    htlc_maximum_msat: 1000, // TODO: actual amount!
-                    fee_base_msat: $node.base_fee as u32,
-                    fee_proportional_millionths: $node.fee_rate_prop as u32,
-                    excess_data: Vec::new(),
-                };
-
-                if graph.update_channel_unsigned(&update).is_err() {
-                    return Err(());
-                }
-            }};
-        }
-
-        generate_and_update_channel!(channel.node_1);
-        generate_and_update_channel!(channel.node_2);
-
-        let update_1 = UnsignedChannelUpdate {
-            chain_hash,
-            short_channel_id: channel.short_channel_id,
-            timestamp: 0,
-            flags: 0, // TODO: check flags
-            cltv_expiry_delta: channel.node_1.cltv_expiry_delta as u16,
-            htlc_minimum_msat: 0,
-            htlc_maximum_msat: 1000, // TODO: actual amount!
-            fee_base_msat: channel.node_1.base_fee as u32,
-            fee_proportional_millionths: channel.node_1.fee_rate_prop as u32,
-            excess_data: Vec::new(),
-        };
-
-        if graph.update_channel_unsigned(&update_1).is_err() {
-            return Err(());
-        }
-    }
-
-    Ok(graph)
-}
-
 #[async_trait]
 trait SimNetwork {
     fn dispatch_payment(
@@ -253,10 +216,7 @@ trait SimNetwork {
 }
 
 #[async_trait]
-impl<L: Deref + std::marker::Send + std::marker::Sync + Copy> SimNetwork for Graph<L>
-where
-    <L as Deref>::Target: Logger,
-{
+impl SimNetwork for Graph<'_> {
     /// dispatch_payment asynchronously propagates a payment through the simulated network, returning a tracking
     /// channel that can be used to obtain the result of the payment.
     fn dispatch_payment(
@@ -269,7 +229,7 @@ where
         let (sender, receiver) = channel();
 
         let params = ProbabilisticScoringDecayParameters::default();
-        let scorer = ProbabilisticScorer::new(params, &self.graph, self.logger);
+        let scorer = ProbabilisticScorer::new(params, &self.graph, &WrappedLog {});
 
         let route = match find_route(
             &ldk_pubkey(source),
@@ -496,7 +456,9 @@ struct Htlc {
     cltv_expiry: u32,
 }
 
-struct SimChannel {
+#[derive(Clone)]
+pub struct SimChannel {
+    short_channel_id: u64,
     node_1: ChannelParticipant,
     node_2: ChannelParticipant,
 
@@ -504,33 +466,13 @@ struct SimChannel {
     capacity_msat: u64,
 }
 
-impl SimChannel {
-    fn from_ldk(info: &ChannelInfo) -> Result<Self, ()> {
-        let capacity_msat = info.capacity_sats.ok_or(())? * 1000;
-
-        Ok(SimChannel {
-            node_1: ChannelParticipant::from_ldk(
-                info.node_one,
-                info.one_to_two.clone().ok_or(())?,
-                capacity_msat,
-                true,
-            )?,
-            node_2: ChannelParticipant::from_ldk(
-                info.node_two,
-                info.two_to_one.clone().ok_or(())?,
-                capacity_msat,
-                false,
-            )?,
-            capacity_msat,
-        })
-    }
-}
-
+#[derive(Clone)]
 pub struct ChannelParticipant {
     id: PublicKey,
     max_htlc_count: u64,
     max_in_flight: u64,
-    // TODO: max htlc size and min htlc size
+    min_htlc_size: u64,
+    max_htlc_size: u64,
     local_balance: u64,
     in_flight: HashMap<PaymentHash, Htlc>,
     cltv_expiry_delta: u32,
@@ -539,27 +481,6 @@ pub struct ChannelParticipant {
 }
 
 impl ChannelParticipant {
-    fn from_ldk(
-        node: NodeId,
-        update: ChannelUpdateInfo,
-        capacity_msat: u64,
-        initiator: bool,
-    ) -> Result<Self, ()> {
-        // TODO: fix workaround with two different pubkey types
-        let pk = PublicKey::from_slice(node.as_slice()).map_err(|_| ())?;
-
-        Ok(ChannelParticipant {
-            id: pk,
-            max_htlc_count: 483, // TODO: infer from implementation?
-            max_in_flight: update.htlc_maximum_msat,
-            local_balance: if initiator { capacity_msat } else { 0 },
-            in_flight: HashMap::new(),
-            cltv_expiry_delta: update.cltv_expiry_delta as u32,
-            base_fee: update.fees.base_msat as u64,
-            fee_rate_prop: update.fees.proportional_millionths as u64,
-        })
-    }
-
     fn in_flight_total(&self) -> u64 {
         self.in_flight
             .iter()
@@ -583,6 +504,14 @@ impl ChannelParticipant {
     fn check_policy(&self, htlc: &Htlc) -> Result<(), ()> {
         // TODO: max htlc size and min htlc size
         if htlc.amount_msat > self.local_balance {
+            return Err(());
+        }
+
+        if htlc.amount_msat < self.min_htlc_size {
+            return Err(());
+        }
+
+        if htlc.amount_msat > self.max_htlc_size {
             return Err(());
         }
 
