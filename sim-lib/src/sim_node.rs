@@ -69,11 +69,21 @@ impl Graph<'_> {
             insert_node_entry!(channel.node_2.pubkey);
         }
 
+        let graph = create_routing_graph(graph_channels)?;
+
+        for (scid, chan) in graph.read_only().channels().unordered_iter() {
+            log::info!("CKC - channel: {}: {}", scid, chan);
+        }
+
+        for (info, node) in graph.read_only().nodes().unordered_iter() {
+            log::info!("CKC - node: {} {}", info, node);
+        }
+
         Ok(Graph {
             nodes,
             channels: Arc::new(Mutex::new(channels)),
             tasks: JoinSet::new(),
-            graph: create_routing_graph(graph_channels)?,
+            graph,
         })
     }
 }
