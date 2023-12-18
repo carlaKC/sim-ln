@@ -71,14 +71,6 @@ impl Graph<'_> {
 
         let graph = create_routing_graph(graph_channels)?;
 
-        for (scid, chan) in graph.read_only().channels().unordered_iter() {
-            log::info!("CKC - channel: {}: {}", scid, chan);
-        }
-
-        for (info, node) in graph.read_only().nodes().unordered_iter() {
-            log::info!("CKC - node: {} {}", info, node);
-        }
-
         Ok(Graph {
             nodes,
             channels: Arc::new(Mutex::new(channels)),
@@ -295,7 +287,6 @@ impl SimNetwork for Graph<'_> {
             }
         };
 
-        log::info!("CKC propagating payment");
         self.tasks.spawn(propagate_payment(
             self.channels.clone(),
             source,
@@ -333,13 +324,11 @@ async fn add_htlcs(
 
     let mut fail_idx = None;
 
-    log::info!("CKC: propagaing payment thorough network");
     // Lookup each hop in the route and add the HTLC to its mock channel.
     for (i, hop) in route.hops.iter().enumerate() {
         let pubkey_str = format!("{}", hop.pubkey);
         let hop_pubkey = PublicKey::from_str(&pubkey_str).unwrap();
 
-        log::info!("CKC looking for channel {}", &hop.short_channel_id);
         match nodes.lock().await.get_mut(&hop.short_channel_id) {
             Some(channel) => {
                 if let Err(e) = channel.add_htlc(
@@ -358,14 +347,12 @@ async fn add_htlcs(
                 // If the HTLC was successfully added, then we'll need to remove the HTLC from this channel if we fail,
                 // so we progress our failure index to include this node.
                 fail_idx = Some(i);
-                log::info!("CKC: checking HTLC forward if not on last hop");
                 // Once we've added the HTLC on this hop's channel, we want to check whether it has sufficient fee
                 // and CLTV delta per the _next_ channel's policy (because fees and CLTV delta in LN are charged on
                 // the outgoing link). We check the policy belonging to the node that we just forwarded to, which
                 // represents the fee in that direction. Note that we don't check the final hop's requirements for CLTV
                 // delta, that's out of scope at present.
                 if i != route.hops.len() - 1 {
-                    log::info!("CKC: on intermediate hop, checking forward");
                     if let Some(channel) =
                         nodes.lock().await.get(&route.hops[i + 1].short_channel_id)
                     {
@@ -381,7 +368,6 @@ async fn add_htlcs(
                         }
                     }
                 } else {
-                    log::info!("CKC: on last hop, don't need to check forward");
                 }
             }
             None => {
@@ -400,12 +386,6 @@ async fn add_htlcs(
         outgoing_amount -= hop.fee_msat;
         outgoing_cltv -= hop.cltv_expiry_delta;
 
-        log::info!(
-            "CKC updating hop to: node out: {}, amount out: {}, cltv out {}",
-            outgoing_node,
-            outgoing_amount,
-            outgoing_cltv,
-        );
         // TODO: latency?
     }
 
@@ -432,15 +412,8 @@ async fn remove_htlcs(
             PublicKey::from_str(&pubkey_str).unwrap()
         };
 
-        log::info!("CKC incoming node: {}", incoming_node);
-
         match nodes.lock().await.get_mut(&hop.short_channel_id) {
             Some(channel) => {
-                log::info!(
-                    "CKC removing htlc from: {}, success: {}",
-                    incoming_node,
-                    success
-                );
                 if channel
                     .remove_htlc(incoming_node, payment_hash, success)
                     .is_err()
@@ -817,7 +790,7 @@ impl<T: SimNetwork + Send + Sync> LightningNode for SimNode<T> {
         amount_msat: u64,
     ) -> Result<PaymentHash, LightningError> {
         let preimage = PaymentPreimage(rand::random());
-        let mut payment_receiver = self.network.lock().await.dispatch_payment(
+        let payment_receiver = self.network.lock().await.dispatch_payment(
             self.info.pubkey,
             dest,
             amount_msat,
@@ -827,7 +800,6 @@ impl<T: SimNetwork + Send + Sync> LightningNode for SimNode<T> {
         let preimage_bytes = Sha256::hash(&preimage.0[..]).to_byte_array();
         let payment_hash = PaymentHash(preimage_bytes);
 
-        log::info!("CKC adding receiver: {:?}", payment_receiver.try_recv());
         self.in_flight.insert(payment_hash, payment_receiver);
 
         Ok(payment_hash)
@@ -840,11 +812,8 @@ impl<T: SimNetwork + Send + Sync> LightningNode for SimNode<T> {
         hash: PaymentHash,
         listener: Listener,
     ) -> Result<PaymentResult, LightningError> {
-        log::info!("CKC trackpayment for {}", hex::encode(hash.0));
-
         match self.in_flight.get_mut(&hash) {
             Some(receiver) => {
-                log::info!("CKC adding receiver: {:?}", receiver.try_recv());
                 select! {
                     biased;
                     _ = listener => Err(LightningError::TrackPaymentError("shutdown during payment tracking".to_string())),
