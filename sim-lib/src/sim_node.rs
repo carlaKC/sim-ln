@@ -130,7 +130,7 @@ fn create_routing_graph(
         };
 
         let utxo_validator = UtxoValidator {
-            amount: channel.capacity_msat,
+            amount_sat: channel.capacity_msat / 1000, 
             script: make_funding_redeemscript(&node_1_pk, &node_2_pk).to_v0_p2wsh(),
         };
 
@@ -151,8 +151,8 @@ fn create_routing_graph(
                     timestamp: 1702667117, // TODO: current time
                     flags: $flags,         // TODO: double check
                     cltv_expiry_delta: $node.cltv_expiry_delta as u16,
-                    htlc_minimum_msat: $node.min_htlc_size,
-                    htlc_maximum_msat: $node.max_htlc_size,
+                    htlc_minimum_msat: $node.min_htlc_size_msat,
+                    htlc_maximum_msat: $node.max_htlc_size_msat,
                     fee_base_msat: $node.base_fee as u32,
                     fee_proportional_millionths: $node.fee_rate_prop as u32,
                     excess_data: Vec::new(),
@@ -205,14 +205,14 @@ impl Logger for WrappedLog {
 // UtxoValidator is a faked utxo validator that just returns a fake output with the desired
 // capacity for a channel.
 struct UtxoValidator {
-    amount: u64,
+    amount_sat: u64,
     script: Script,
 }
 
 impl UtxoLookup for UtxoValidator {
     fn get_utxo(&self, _genesis_hash: &BlockHash, _short_channel_id: u64) -> UtxoResult {
         UtxoResult::Sync(Ok(TxOut {
-            value: self.amount,
+            value: self.amount_sat,
             script_pubkey: self.script.clone(),
         }))
     }
@@ -484,10 +484,10 @@ pub struct SimChannel {
 pub struct ChannelParticipant {
     pubkey: PublicKey,
     max_htlc_count: u64,
-    max_in_flight: u64,
-    min_htlc_size: u64,
-    max_htlc_size: u64,
-    local_balance: u64,
+    max_in_flight_msat: u64,
+    min_htlc_size_msat: u64,
+    max_htlc_size_msat: u64,
+    local_balance_msat: u64,
     in_flight: HashMap<PaymentHash, Htlc>,
     cltv_expiry_delta: u32,
     base_fee: u64,
@@ -510,10 +510,10 @@ impl ChannelParticipant {
         ChannelParticipant {
             pubkey,
             max_htlc_count,
-            max_in_flight,
-            min_htlc_size,
-            max_htlc_size,
-            local_balance: if initiator { capacity } else { 0 },
+            max_in_flight_msat: max_in_flight,
+            min_htlc_size_msat: min_htlc_size,
+            max_htlc_size_msat: max_htlc_size,
+            local_balance_msat: if initiator { capacity } else { 0 },
             in_flight: HashMap::new(),
             cltv_expiry_delta,
             base_fee,
@@ -542,16 +542,15 @@ impl ChannelParticipant {
     }
 
     fn check_policy(&self, htlc: &Htlc) -> Result<(), ()> {
-        // TODO: max htlc size and min htlc size
-        if htlc.amount_msat > self.local_balance {
+        if htlc.amount_msat > self.local_balance_msat {
             return Err(());
         }
 
-        if htlc.amount_msat < self.min_htlc_size {
+        if htlc.amount_msat < self.min_htlc_size_msat {
             return Err(());
         }
 
-        if htlc.amount_msat > self.max_htlc_size {
+        if htlc.amount_msat > self.max_htlc_size_msat {
             return Err(());
         }
 
@@ -559,7 +558,7 @@ impl ChannelParticipant {
             return Err(());
         }
 
-        if self.in_flight_total() + htlc.amount_msat > self.max_in_flight {
+        if self.in_flight_total() + htlc.amount_msat > self.max_in_flight_msat {
             return Err(());
         }
 
@@ -576,7 +575,7 @@ impl ChannelParticipant {
         match self.in_flight.get(&htlc.hash) {
             Some(_) => Err(()),
             None => {
-                self.local_balance -= htlc.amount_msat;
+                self.local_balance_msat -= htlc.amount_msat;
                 self.in_flight.insert(htlc.hash, htlc);
                 Ok(())
             }
@@ -588,7 +587,7 @@ impl ChannelParticipant {
             Some(v) => {
                 // If the HTLC failed, pending balance returns to local balance.
                 if !success {
-                    self.local_balance += v.amount_msat
+                    self.local_balance_msat += v.amount_msat
                 }
 
                 Ok(v)
@@ -622,8 +621,8 @@ impl SimChannel {
     /// performs a sanity check on the total balances in a channel. Note that we do not currently include on-chain
     /// fees or reserve so these values should exactly match.
     fn sanity_check(&self) {
-        let node_1_total = self.node_1.local_balance + self.node_1.in_flight_total();
-        let node_2_total = self.node_2.local_balance + self.node_2.in_flight_total();
+        let node_1_total = self.node_1.local_balance_msat + self.node_1.in_flight_total();
+        let node_2_total = self.node_2.local_balance_msat + self.node_2.in_flight_total();
 
         if node_1_total + node_2_total != self.capacity_msat {
             panic!(
@@ -645,7 +644,7 @@ impl SimChannel {
                 // If the HTLC was settled, its amount is transferred to the remote party's local balance.
                 // If it was failed, the above removal has already dealt with balance management.
                 if success {
-                    self.node_2.local_balance += htlc.amount_msat
+                    self.node_2.local_balance_msat += htlc.amount_msat
                 }
                 self.sanity_check();
 
@@ -660,7 +659,7 @@ impl SimChannel {
                 // If the HTLC was settled, its amount is transferred to the remote party's local balance.
                 // If it was failed, the above removal has already dealt with balance management.
                 if success {
-                    self.node_1.local_balance += htlc.amount_msat
+                    self.node_1.local_balance_msat += htlc.amount_msat
                 }
 
                 self.sanity_check();
