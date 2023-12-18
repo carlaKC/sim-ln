@@ -347,21 +347,22 @@ async fn propagate_payment(
 
         match nodes.lock().await.get_mut(&hop.short_channel_id) {
             Some(channel) => {
-                if channel
-                    .add_htlc(
-                        outgoing_node,
-                        Htlc {
-                            amount_msat: outgoing_amount,
-                            cltv_expiry: outgoing_cltv,
-                            hash: payment_hash,
-                        },
-                    )
-                    .is_err()
-                {
+                if let Err(e) = channel.add_htlc(
+                    outgoing_node,
+                    Htlc {
+                        amount_msat: outgoing_amount,
+                        cltv_expiry: outgoing_cltv,
+                        hash: payment_hash,
+                    },
+                ) {
                     // Note: do this in a better way?
                     if i != 0 {
                         fail_idx = Some(i - 1);
                         require_resolution = true;
+                    }
+
+                    if let Err(send_err) = sender.send(Err(e)) {
+                        log::error!("Could not send payment error: {:?}", send_err);
                     }
 
                     break;
@@ -541,39 +542,63 @@ impl ChannelParticipant {
         Ok(())
     }
 
-    fn check_policy(&self, htlc: &Htlc) -> Result<(), ()> {
+    fn check_policy(&self, htlc: &Htlc) -> Result<(), LightningError> {
         if htlc.amount_msat > self.local_balance_msat {
-            return Err(());
+            return Err(LightningError::SendPaymentError(format!(
+                "local balance: {} insufficient to add htlc: {}",
+                self.local_balance_msat, htlc.amount_msat
+            )));
         }
 
         if htlc.amount_msat < self.min_htlc_size_msat {
-            return Err(());
+            return Err(LightningError::SendPaymentError(format!(
+                "htlc: {} < min htlc: {}",
+                htlc.amount_msat, self.min_htlc_size_msat
+            )));
         }
 
         if htlc.amount_msat > self.max_htlc_size_msat {
-            return Err(());
+            return Err(LightningError::SendPaymentError(format!(
+                "htlc: {} > max htlc: {}",
+                htlc.amount_msat, self.max_htlc_size_msat
+            )));
         }
 
         if self.in_flight.len() as u64 + 1 > self.max_htlc_count {
-            return Err(());
+            return Err(LightningError::SendPaymentError(format!(
+                "in flight count: {} reached with {} htlcs",
+                self.max_htlc_count,
+                self.in_flight.len()
+            )));
         }
 
         if self.in_flight_total() + htlc.amount_msat > self.max_in_flight_msat {
-            return Err(());
+            return Err(LightningError::SendPaymentError(format!(
+                "in flight max: {} exceeded by htlc: {} with {} in flight",
+                self.max_htlc_size_msat,
+                htlc.amount_msat,
+                self.in_flight_total()
+            )));
         }
 
         if htlc.cltv_expiry > 500000000 {
-            return Err(());
+            return Err(LightningError::SendPaymentError(format!(
+                "cltv expiry: {} expressed in seconds",
+                htlc.cltv_expiry
+            )));
         }
 
         Ok(())
     }
 
-    fn add_outgoing_htlc(&mut self, htlc: Htlc) -> Result<(), ()> {
+    fn add_outgoing_htlc(&mut self, htlc: Htlc) -> Result<(), LightningError> {
         self.check_policy(&htlc)?;
 
         match self.in_flight.get(&htlc.hash) {
-            Some(_) => Err(()),
+            Some(_) => Err(LightningError::SendPaymentError(format!(
+                "Payment hash: {} already exists in channel",
+                hex::encode(htlc.hash.0)
+            ))),
             None => {
                 self.local_balance_msat -= htlc.amount_msat;
                 self.in_flight.insert(htlc.hash, htlc);
@@ -598,9 +623,11 @@ impl ChannelParticipant {
 }
 
 impl SimChannel {
-    fn add_htlc(&mut self, node: PublicKey, htlc: Htlc) -> Result<(), ()> {
+    fn add_htlc(&mut self, node: PublicKey, htlc: Htlc) -> Result<(), LightningError> {
         if htlc.amount_msat == 0 {
-            return Err(());
+            return Err(LightningError::SendPaymentError(
+                "zero htlc amount".to_string(),
+            ));
         }
 
         if node == self.node_1.pubkey {
@@ -615,7 +642,10 @@ impl SimChannel {
             return res;
         }
 
-        Err(())
+        Err(LightningError::SendPaymentError(format!(
+            "HTLC added for node: {} that does not own channel (node_1: {}, node_2: {})",
+            node, self.node_1.pubkey, self.node_2.pubkey
+        )))
     }
 
     /// performs a sanity check on the total balances in a channel. Note that we do not currently include on-chain
@@ -727,7 +757,7 @@ impl<T: SimNetwork + Send + Sync> LightningNode for SimNode<T> {
         amount_msat: u64,
     ) -> Result<PaymentHash, LightningError> {
         let preimage = PaymentPreimage(rand::random());
-        let payment_receiver = self.network.lock().await.dispatch_payment(
+        let mut payment_receiver = self.network.lock().await.dispatch_payment(
             self.info.pubkey,
             dest,
             amount_msat,
