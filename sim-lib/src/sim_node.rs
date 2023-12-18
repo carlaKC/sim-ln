@@ -31,6 +31,24 @@ use triggered::Listener;
 pub enum SimNodeError {
     SetupError(String),
 }
+
+#[derive(Debug)]
+pub enum ForwardingError {
+    // TODO: make sure ordering is consistent and add custom display (?).
+    ZeroAmountHtlc,
+    ChannelNotFound(u64),
+    NodeNotFound(PublicKey),
+    PaymentHashExists(PaymentHash),
+    InsufficientBalance(u64, u64),
+    LessThanMinimum(u64, u64),
+    MoreThanMaximum(u64, u64),
+    ExceedsInFlightCount(u64, u64),
+    ExceedsInFlightTotal(u64, u64, u64),
+    ExpiryInSeconds(u32),
+    InsufficientCltvDelta(u32, u32),
+    InsufficientFee(u64, u64, u64),
+}
+
 /// Graph is the top level struct that is used to coordinate simulation of lightning nodes.
 pub struct Graph<'a> {
     // nodes caches the list of nodes in the network with a vector of their channel capacities.
@@ -267,22 +285,33 @@ impl SimNetwork for Graph<'_> {
         ) {
             Ok(path) => path,
             Err(e) => {
-                // TODO: can we send a erro without blocking?
-                // TODO: what if the send on the channel errors? log
-                let _ = sender.send(Err(LightningError::SendPaymentError(format!(
-                    "no route: {:?}",
-                    e
-                ))));
+                log::trace!("Could not find path for payment: {:?}.", e);
+
+                if let Err(e) = sender.send(Ok(PaymentResult {
+                    htlc_count: 0,
+                    payment_outcome: PaymentOutcome::RouteNotFound,
+                })) {
+                    log::error!("Could not send payment result: {:?}.", e);
+                }
+
                 return receiver;
             }
         };
 
+        // Since we're not supporting MPP, just grab the first path off our route. If we don't have at least one path,
+        // log a warning - this is unexpected - and fail the payment.
         let path = match route.paths.first() {
             Some(p) => p,
             None => {
-                let _ = sender.send(Err(LightningError::SendPaymentError(
-                    "route did not return any paths".to_string(),
-                )));
+                log::warn!("Find route did not return expected number of paths.");
+
+                if let Err(e) = sender.send(Ok(PaymentResult {
+                    htlc_count: 0,
+                    payment_outcome: PaymentOutcome::RouteNotFound,
+                })) {
+                    log::error!("Could not send payment result: {:?}.", e);
+                }
+
                 return receiver;
             }
         };
@@ -314,7 +343,7 @@ async fn add_htlcs(
     source: PublicKey,
     route: Path,
     payment_hash: PaymentHash,
-) -> Result<(), (Option<usize>, LightningError)> {
+) -> Result<(), (Option<usize>, ForwardingError)> {
     let mut outgoing_node = source;
     let mut outgoing_amount = route.fee_msat() + route.final_value_msat();
     let mut outgoing_cltv = route
@@ -367,16 +396,12 @@ async fn add_htlcs(
                             return Err((fail_idx, e));
                         }
                     }
-                } else {
                 }
             }
             None => {
                 return Err((
                     fail_idx,
-                    LightningError::SendPaymentError(format!(
-                        "channel: {} not found",
-                        hop.short_channel_id
-                    )),
+                    ForwardingError::ChannelNotFound(hop.short_channel_id),
                 ))
             }
         }
@@ -463,10 +488,10 @@ async fn propagate_payment(
                 log::error!("Could not remove successful htlc: {e}.");
             }
 
-            Ok(PaymentResult {
+            PaymentResult {
                 htlc_count: 1,
                 payment_outcome: PaymentOutcome::Success,
-            })
+            }
         }
         Err((fail_idx, err)) => {
             // If we partially added HTLCs along the route, we need to fail them back to the source to clean up our
@@ -481,11 +506,17 @@ async fn propagate_payment(
                 }
             }
 
-            Err(err)
+            // We have more information about failures because we're in control of the whole route, so we log the
+            // actual failure reason and then fail back with unknown failure type.
+            log::debug!("Forwarding failure for simulated payment: {:?}", err);
+            PaymentResult {
+                htlc_count: 0,
+                payment_outcome: PaymentOutcome::Unknown,
+            }
         }
     };
 
-    if let Err(e) = sender.send(notify_result) {
+    if let Err(e) = sender.send(Ok(notify_result)) {
         log::error!("Could not notify payment result: {:?}.", e);
     }
 }
@@ -552,83 +583,76 @@ impl ChannelParticipant {
             .fold(0, |sum, val| sum + val.1.amount_msat)
     }
 
-    fn check_forward(&self, cltv_delta: u32, amt: u64, fee: u64) -> Result<(), LightningError> {
+    fn check_forward(&self, cltv_delta: u32, amt: u64, fee: u64) -> Result<(), ForwardingError> {
         if cltv_delta < self.cltv_expiry_delta {
-            return Err(LightningError::SendPaymentError(format!(
-                "insufficient cltv: {} for delta: {}",
-                cltv_delta, self.cltv_expiry_delta
-            )));
+            return Err(ForwardingError::InsufficientCltvDelta(
+                cltv_delta,
+                self.cltv_expiry_delta,
+            ));
         }
 
         let expected_fee =
             self.base_fee as f64 + ((self.fee_rate_prop as f64 * amt as f64) / 1000000.0);
         if (fee as f64) < expected_fee {
-            return Err(LightningError::SendPaymentError(format!(
-                "expected fee: {} from base: {} and ppm: {}, got: {}",
-                expected_fee, self.base_fee, self.fee_rate_prop, fee
-            )));
+            return Err(ForwardingError::InsufficientFee(
+                fee,
+                self.base_fee,
+                self.fee_rate_prop,
+            ));
         }
 
         Ok(())
     }
 
-    fn check_policy(&self, htlc: &Htlc) -> Result<(), LightningError> {
+    fn check_policy(&self, htlc: &Htlc) -> Result<(), ForwardingError> {
         if htlc.amount_msat > self.local_balance_msat {
-            return Err(LightningError::SendPaymentError(format!(
-                "local balance: {} insufficient to add htlc: {}",
-                self.local_balance_msat, htlc.amount_msat
-            )));
+            return Err(ForwardingError::InsufficientBalance(
+                htlc.amount_msat,
+                self.local_balance_msat,
+            ));
         }
 
         if htlc.amount_msat < self.min_htlc_size_msat {
-            return Err(LightningError::SendPaymentError(format!(
-                "htlc: {} < min htlc: {}",
-                htlc.amount_msat, self.min_htlc_size_msat
-            )));
+            return Err(ForwardingError::LessThanMinimum(
+                htlc.amount_msat,
+                self.min_htlc_size_msat,
+            ));
         }
 
         if htlc.amount_msat > self.max_htlc_size_msat {
-            return Err(LightningError::SendPaymentError(format!(
-                "htlc: {} > max htlc: {}",
-                htlc.amount_msat, self.max_htlc_size_msat
-            )));
+            return Err(ForwardingError::MoreThanMaximum(
+                htlc.amount_msat,
+                self.max_htlc_size_msat,
+            ));
         }
 
         if self.in_flight.len() as u64 + 1 > self.max_htlc_count {
-            return Err(LightningError::SendPaymentError(format!(
-                "in flight count: {} reached with {} htlcs",
+            return Err(ForwardingError::ExceedsInFlightCount(
+                self.in_flight.len() as u64,
                 self.max_htlc_count,
-                self.in_flight.len()
-            )));
+            ));
         }
 
         if self.in_flight_total() + htlc.amount_msat > self.max_in_flight_msat {
-            return Err(LightningError::SendPaymentError(format!(
-                "in flight max: {} exceeded by htlc: {} with {} in flight",
-                self.max_htlc_size_msat,
+            return Err(ForwardingError::ExceedsInFlightTotal(
                 htlc.amount_msat,
-                self.in_flight_total()
-            )));
+                self.in_flight_total(),
+                self.max_in_flight_msat,
+            ));
         }
 
         if htlc.cltv_expiry > 500000000 {
-            return Err(LightningError::SendPaymentError(format!(
-                "cltv expiry: {} expressed in seconds",
-                htlc.cltv_expiry
-            )));
+            return Err(ForwardingError::ExpiryInSeconds(htlc.cltv_expiry));
         }
 
         Ok(())
     }
 
-    fn add_outgoing_htlc(&mut self, htlc: Htlc) -> Result<(), LightningError> {
+    fn add_outgoing_htlc(&mut self, htlc: Htlc) -> Result<(), ForwardingError> {
         self.check_policy(&htlc)?;
 
         match self.in_flight.get(&htlc.hash) {
-            Some(_) => Err(LightningError::SendPaymentError(format!(
-                "Payment hash: {} already exists in channel",
-                hex::encode(htlc.hash.0)
-            ))),
+            Some(_) => Err(ForwardingError::PaymentHashExists(htlc.hash)),
             None => {
                 self.local_balance_msat -= htlc.amount_msat;
                 self.in_flight.insert(htlc.hash, htlc);
@@ -653,11 +677,9 @@ impl ChannelParticipant {
 }
 
 impl SimChannel {
-    fn add_htlc(&mut self, node: PublicKey, htlc: Htlc) -> Result<(), LightningError> {
+    fn add_htlc(&mut self, node: PublicKey, htlc: Htlc) -> Result<(), ForwardingError> {
         if htlc.amount_msat == 0 {
-            return Err(LightningError::SendPaymentError(
-                "zero htlc amount".to_string(),
-            ));
+            return Err(ForwardingError::ZeroAmountHtlc);
         }
 
         if node == self.node_1.pubkey {
@@ -672,10 +694,9 @@ impl SimChannel {
             return res;
         }
 
-        Err(LightningError::SendPaymentError(format!(
-            "HTLC added for node: {} that does not own channel (node_1: {}, node_2: {})",
-            node, self.node_1.pubkey, self.node_2.pubkey
-        )))
+        Err(ForwardingError::NodeNotFound(
+            node,
+        ))
     }
 
     /// performs a sanity check on the total balances in a channel. Note that we do not currently include on-chain
@@ -738,7 +759,7 @@ impl SimChannel {
         cltv_delta: u32,
         amount_msat: u64,
         fee_msat: u64,
-    ) -> Result<(), LightningError> {
+    ) -> Result<(), ForwardingError> {
         if node == self.node_1.pubkey {
             return self.node_1.check_forward(cltv_delta, amount_msat, fee_msat);
         }
@@ -747,10 +768,9 @@ impl SimChannel {
             return self.node_2.check_forward(cltv_delta, amount_msat, fee_msat);
         }
 
-        Err(LightningError::SendPaymentError(format!(
-            "forwarding node: {} not found in channel (node_1: {}, node_2: {})",
-            node, self.node_1.pubkey, self.node_2.pubkey
-        )))
+        Err(ForwardingError::NodeNotFound(
+            node,
+        ))
     }
 }
 
