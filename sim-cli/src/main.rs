@@ -184,7 +184,7 @@ async fn main() -> anyhow::Result<()> {
     let capacity = 300000000;
     let pubkey_1 =
         PublicKey::from_str("039ae6b91fbec1b400adffcd7f7132e81efbb5aaeeeb061903695a919652aee761")?;
-    let node_1 = ChannelParticipant::new(
+    let alice_to_bob = ChannelParticipant::new(
         pubkey_1,
         483,
         capacity / 2,
@@ -199,7 +199,7 @@ async fn main() -> anyhow::Result<()> {
 
     let pubkey_2 =
         PublicKey::from_str("0275ade20b15f2a309d8db2d7ea4f5004129204b83d2307433292f183bdbe5df2e")?;
-    let node_2 = ChannelParticipant::new(
+    let bob_to_alice = ChannelParticipant::new(
         pubkey_2,
         483,
         capacity / 2,
@@ -212,12 +212,49 @@ async fn main() -> anyhow::Result<()> {
         capacity,
     );
 
-    let graph = match Graph::new(vec![SimChannel {
+    let bob_to_carol = ChannelParticipant::new(
+        pubkey_2,
+        483,
+        capacity / 2,
+        1,
+        capacity / 2,
+        40,
+        1000,
+        1,
+        true,
+        capacity,
+    );
+
+    let pubkey_3 =
+        PublicKey::from_str("028a4929f8c7fe3ce735f86d35e716efe406956dfe6ff1e1f88ea11207976a720b")?;
+    let carol_to_bob = ChannelParticipant::new(
+        pubkey_3,
+        483,
+        capacity / 2,
+        1,
+        capacity / 2,
+        15,
+        2000,
+        1,
+        false,
+        capacity,
+    );
+
+    let chan_alice_bob = SimChannel {
         capacity_msat: capacity,
         short_channel_id: 123,
-        node_1,
-        node_2,
-    }]) {
+        node_1: alice_to_bob,
+        node_2: bob_to_alice,
+    };
+
+    let chan_bob_carol = SimChannel {
+        capacity_msat: capacity,
+        short_channel_id: 456,
+        node_1: bob_to_carol,
+        node_2: carol_to_bob,
+    };
+
+    let graph = match Graph::new(vec![chan_alice_bob, chan_bob_carol]) {
         Ok(graph) => Arc::new(Mutex::new(graph)),
         Err(e) => anyhow::bail!("failed: {:?}", e),
     };
