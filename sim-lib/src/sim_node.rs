@@ -130,7 +130,7 @@ fn create_routing_graph(
         };
 
         let utxo_validator = UtxoValidator {
-            amount_sat: channel.capacity_msat / 1000, 
+            amount_sat: channel.capacity_msat / 1000,
             script: make_funding_redeemscript(&node_1_pk, &node_2_pk).to_v0_p2wsh(),
         };
 
