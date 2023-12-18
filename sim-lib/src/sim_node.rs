@@ -54,7 +54,7 @@ pub enum ForwardingError {
     ExpiryInSeconds(u32),
     // cltv delta / minimum delta
     InsufficientCltvDelta(u32, u32),
-    //
+    // fee / base / prop / expected
     InsufficientFee(u64, u64, u64, f64),
 }
 
@@ -390,7 +390,7 @@ async fn add_htlcs(
 
         match nodes.lock().await.get_mut(&hop.short_channel_id) {
 
-		let mut node_lock = nodes.lock().await;
+        let mut node_lock = nodes.lock().await;
 
         match node_lock.get_mut(&hop.short_channel_id) {
             Some(channel) => {
@@ -417,9 +417,7 @@ async fn add_htlcs(
                 // represents the fee in that direction. Note that we don't check the final hop's requirements for CLTV
                 // delta, that's out of scope at present.
                 if i != route.hops.len() - 1 {
-                    if let Some(channel) =
-                        node_lock.get(&route.hops[i + 1].short_channel_id)
-                    {
+                    if let Some(channel) = node_lock.get(&route.hops[i + 1].short_channel_id) {
                         if let Err(e) = channel.check_htlc_forward(
                             hop_pubkey,
                             hop.cltv_expiry_delta,
@@ -603,7 +601,7 @@ impl ChannelParticipant {
             max_in_flight_msat: max_in_flight,
             min_htlc_size_msat: min_htlc_size,
             max_htlc_size_msat: max_htlc_size,
-            local_balance_msat: capacity/2,
+            local_balance_msat: capacity / 2,
             in_flight: HashMap::new(),
             cltv_expiry_delta,
             base_fee,
@@ -729,9 +727,7 @@ impl SimChannel {
             return res;
         }
 
-        Err(ForwardingError::NodeNotFound(
-            node,
-        ))
+        Err(ForwardingError::NodeNotFound(node))
     }
 
     /// performs a sanity check on the total balances in a channel. Note that we do not currently include on-chain
@@ -803,9 +799,7 @@ impl SimChannel {
             return self.node_2.check_forward(cltv_delta, amount_msat, fee_msat);
         }
 
-        Err(ForwardingError::NodeNotFound(
-            node,
-        ))
+        Err(ForwardingError::NodeNotFound(node))
     }
 }
 
