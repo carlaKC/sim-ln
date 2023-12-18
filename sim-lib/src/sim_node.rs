@@ -359,6 +359,10 @@ async fn add_htlcs(
         let hop_pubkey = PublicKey::from_str(&pubkey_str).unwrap();
 
         match nodes.lock().await.get_mut(&hop.short_channel_id) {
+
+		let mut node_lock = nodes.lock().await;
+
+        match node_lock.get_mut(&hop.short_channel_id) {
             Some(channel) => {
                 if let Err(e) = channel.add_htlc(
                     outgoing_node,
@@ -376,6 +380,7 @@ async fn add_htlcs(
                 // If the HTLC was successfully added, then we'll need to remove the HTLC from this channel if we fail,
                 // so we progress our failure index to include this node.
                 fail_idx = Some(i);
+
                 // Once we've added the HTLC on this hop's channel, we want to check whether it has sufficient fee
                 // and CLTV delta per the _next_ channel's policy (because fees and CLTV delta in LN are charged on
                 // the outgoing link). We check the policy belonging to the node that we just forwarded to, which
@@ -383,7 +388,7 @@ async fn add_htlcs(
                 // delta, that's out of scope at present.
                 if i != route.hops.len() - 1 {
                     if let Some(channel) =
-                        nodes.lock().await.get(&route.hops[i + 1].short_channel_id)
+                        node_lock.get(&route.hops[i + 1].short_channel_id)
                     {
                         if let Err(e) = channel.check_htlc_forward(
                             hop_pubkey,
