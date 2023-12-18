@@ -1,4 +1,4 @@
-use crate::{LightningError, LightningNode, NodeInfo, PaymentResult};
+use crate::{LightningError, LightningNode, NodeInfo, PaymentOutcome, PaymentResult};
 use async_trait::async_trait;
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
@@ -294,12 +294,12 @@ impl SimNetwork for Graph<'_> {
                 return receiver;
             }
         };
+
+        log::info!("CKC propagating payment");
         self.tasks.spawn(propagate_payment(
             self.channels.clone(),
             source,
-            dest,
             path.clone(),
-            amount_msat,
             preimage,
             sender,
         ));
@@ -318,15 +318,12 @@ impl SimNetwork for Graph<'_> {
     }
 }
 
-async fn propagate_payment(
+async fn add_htlcs(
     nodes: Arc<Mutex<HashMap<u64, SimChannel>>>,
     source: PublicKey,
-    dest: PublicKey,
     route: Path,
-    amount_msat: u64,
-    preimage: PaymentPreimage,
-    sender: Sender<Result<PaymentResult, LightningError>>,
-) {
+    payment_hash: PaymentHash,
+) -> Result<(), (Option<usize>, LightningError)> {
     let mut outgoing_node = source;
     let mut outgoing_amount = route.fee_msat() + route.final_value_msat();
     let mut outgoing_cltv = route
@@ -334,17 +331,15 @@ async fn propagate_payment(
         .iter()
         .fold(0, |sum, value| sum + value.cltv_expiry_delta);
 
-    let preimage_bytes = Sha256::hash(&preimage.0[..]).to_byte_array();
-    let payment_hash = PaymentHash(preimage_bytes);
-
     let mut fail_idx = None;
-    let mut require_resolution = false;
 
+    log::info!("CKC: propagaing payment thorough network");
     // Lookup each hop in the route and add the HTLC to its mock channel.
     for (i, hop) in route.hops.iter().enumerate() {
         let pubkey_str = format!("{}", hop.pubkey);
         let hop_pubkey = PublicKey::from_str(&pubkey_str).unwrap();
 
+        log::info!("CKC looking for channel {}", &hop.short_channel_id);
         match nodes.lock().await.get_mut(&hop.short_channel_id) {
             Some(channel) => {
                 if let Err(e) = channel.add_htlc(
@@ -355,60 +350,48 @@ async fn propagate_payment(
                         hash: payment_hash,
                     },
                 ) {
-                    // Note: do this in a better way?
-                    if i != 0 {
-                        fail_idx = Some(i - 1);
-                        require_resolution = true;
-                    }
-
-                    if let Err(send_err) = sender.send(Err(e)) {
-                        log::error!("Could not send payment error: {:?}", send_err);
-                    }
-
-                    break;
+                    // If we couldn't add to this HTLC, we only need to fail back from the preceeding hop, so we don't
+                    // have to progress our fail_idx.
+                    return Err((fail_idx, e));
                 }
 
+                // If the HTLC was successfully added, then we'll need to remove the HTLC from this channel if we fail,
+                // so we progress our failure index to include this node.
+                fail_idx = Some(i);
+                log::info!("CKC: checking HTLC forward if not on last hop");
                 // Once we've added the HTLC on this hop's channel, we want to check whether it has sufficient fee
                 // and CLTV delta per the _next_ channel's policy (because fees and CLTV delta in LN are charged on
                 // the outgoing link). We check the policy belonging to the node that we just forwarded to, which
                 // represents the fee in that direction. Note that we don't check the final hop's requirements for CLTV
                 // delta, that's out of scope at present.
                 if i != route.hops.len() - 1 {
+                    log::info!("CKC: on intermediate hop, checking forward");
                     if let Some(channel) =
                         nodes.lock().await.get(&route.hops[i + 1].short_channel_id)
                     {
-                        if channel
-                            .check_htlc_forward(
-                                hop_pubkey,
-                                hop.cltv_expiry_delta,
-                                outgoing_amount - hop.fee_msat, // TODO: check the amount that we calc fee on
-                                hop.fee_msat,
-                            )
-                            .is_err()
-                        {
+                        if let Err(e) = channel.check_htlc_forward(
+                            hop_pubkey,
+                            hop.cltv_expiry_delta,
+                            outgoing_amount - hop.fee_msat, // TODO: check the amount that we calc fee on
+                            hop.fee_msat,
+                        ) {
                             // If we haven't met forwarding conditions for the next channel's policy, then we fail at
                             // index i, because we've already added the HTLC as outgoing.
-                            fail_idx = Some(i)
+                            return Err((fail_idx, e));
                         }
                     }
+                } else {
+                    log::info!("CKC: on last hop, don't need to check forward");
                 }
             }
             None => {
-                if i != 0 {
-                    fail_idx = Some(i - 1);
-                    require_resolution = true;
-                }
-
-                let err = Err(LightningError::SendPaymentError(format!(
-                    "channel {} not found for payment {} to {}",
-                    hop.short_channel_id, amount_msat, dest
-                )));
-
-                if sender.send(err).is_err() {
-                    // log a warning?
-                }
-
-                break;
+                return Err((
+                    fail_idx,
+                    LightningError::SendPaymentError(format!(
+                        "channel: {} not found",
+                        hop.short_channel_id
+                    )),
+                ))
             }
         }
 
@@ -417,20 +400,26 @@ async fn propagate_payment(
         outgoing_amount -= hop.fee_msat;
         outgoing_cltv -= hop.cltv_expiry_delta;
 
+        log::info!(
+            "CKC updating hop to: node out: {}, amount out: {}, cltv out {}",
+            outgoing_node,
+            outgoing_amount,
+            outgoing_cltv,
+        );
         // TODO: latency?
     }
 
-    // If we failed adding our very first hop then we don't need to unwrap any htlcs.
-    if !require_resolution {
-        return;
-    }
+    Ok(())
+}
 
-    // Once we've added our HTLC along the route (either all the way, successfully, or part of the way, with a failure
-    // occurring along the way) we need to settle back the HTLC. We know the start point for this process and whether
-    // the HTLC succeeded based on whether our fail_idx was populated.
-    let resolution_idx = fail_idx.unwrap_or(route.hops.len() - 1);
-    let success = fail_idx.is_none();
-
+async fn remove_htlcs(
+    nodes: Arc<Mutex<HashMap<u64, SimChannel>>>,
+    resolution_idx: usize,
+    source: PublicKey,
+    route: Path,
+    payment_hash: PaymentHash,
+    success: bool,
+) -> Result<(), LightningError> {
     for i in resolution_idx..0 {
         let hop = &route.hops[i];
 
@@ -443,26 +432,88 @@ async fn propagate_payment(
             PublicKey::from_str(&pubkey_str).unwrap()
         };
 
+        log::info!("CKC incoming node: {}", incoming_node);
+
         match nodes.lock().await.get_mut(&hop.short_channel_id) {
             Some(channel) => {
+                log::info!(
+                    "CKC removing htlc from: {}, success: {}",
+                    incoming_node,
+                    success
+                );
                 if channel
                     .remove_htlc(incoming_node, payment_hash, success)
                     .is_err()
                 {
-                    panic!(
+                    return Err(LightningError::SendPaymentError(format!(
                         "could not remove htlc {} from {}",
                         hex::encode(payment_hash.0),
                         hop.short_channel_id
-                    )
+                    )));
                 }
             }
             None => {
-                panic!(
+                return Err(LightningError::SendPaymentError(format!(
                     "successfully added HTLC not found on resolution: {}",
                     hop.short_channel_id
-                )
+                )));
             }
         }
+    }
+
+    Ok(())
+}
+
+async fn propagate_payment(
+    nodes: Arc<Mutex<HashMap<u64, SimChannel>>>,
+    source: PublicKey,
+    route: Path,
+    preimage: PaymentPreimage,
+    sender: Sender<Result<PaymentResult, LightningError>>,
+) {
+    let preimage_bytes = Sha256::hash(&preimage.0[..]).to_byte_array();
+    let payment_hash = PaymentHash(preimage_bytes);
+
+    let notify_result = match add_htlcs(nodes.clone(), source, route.clone(), payment_hash).await {
+        Ok(_) => {
+            if let Err(e) = remove_htlcs(
+                nodes,
+                route.hops.len() - 1,
+                source,
+                route,
+                payment_hash,
+                true,
+            )
+            .await
+            {
+                // TODO: critical error, our state machine isn't working.
+                log::error!("Could not remove successful htlc: {e}.");
+            }
+
+            Ok(PaymentResult {
+                htlc_count: 1,
+                payment_outcome: PaymentOutcome::Success,
+            })
+        }
+        Err((fail_idx, err)) => {
+            // If we partially added HTLCs along the route, we need to fail them back to the source to clean up our
+            // partial state. It's possible that we failed with the very first add, and then we don't need to clean
+            // anything up.
+            if let Some(resolution_idx) = fail_idx {
+                if let Err(e) =
+                    remove_htlcs(nodes, resolution_idx, source, route, payment_hash, false).await
+                {
+                    // TODO: critical error, our state machine isn't working.
+                    log::error!("Could not remove htlcs: {e}.");
+                }
+            }
+
+            Err(err)
+        }
+    };
+
+    if let Err(e) = sender.send(notify_result) {
+        log::error!("Could not notify payment result: {:?}.", e);
     }
 }
 
@@ -528,15 +579,21 @@ impl ChannelParticipant {
             .fold(0, |sum, val| sum + val.1.amount_msat)
     }
 
-    fn check_forward(&self, cltv_delta: u32, amt: u64, fee: u64) -> Result<(), ()> {
+    fn check_forward(&self, cltv_delta: u32, amt: u64, fee: u64) -> Result<(), LightningError> {
         if cltv_delta < self.cltv_expiry_delta {
-            return Err(());
+            return Err(LightningError::SendPaymentError(format!(
+                "insufficient cltv: {} for delta: {}",
+                cltv_delta, self.cltv_expiry_delta
+            )));
         }
 
         let expected_fee =
             self.base_fee as f64 + ((self.fee_rate_prop as f64 * amt as f64) / 1000000.0);
         if (fee as f64) < expected_fee {
-            return Err(());
+            return Err(LightningError::SendPaymentError(format!(
+                "expected fee: {} from base: {} and ppm: {}, got: {}",
+                expected_fee, self.base_fee, self.fee_rate_prop, fee
+            )));
         }
 
         Ok(())
@@ -708,7 +765,7 @@ impl SimChannel {
         cltv_delta: u32,
         amount_msat: u64,
         fee_msat: u64,
-    ) -> Result<(), ()> {
+    ) -> Result<(), LightningError> {
         if node == self.node_1.pubkey {
             return self.node_1.check_forward(cltv_delta, amount_msat, fee_msat);
         }
@@ -717,7 +774,10 @@ impl SimChannel {
             return self.node_2.check_forward(cltv_delta, amount_msat, fee_msat);
         }
 
-        Err(())
+        Err(LightningError::SendPaymentError(format!(
+            "forwarding node: {} not found in channel (node_1: {}, node_2: {})",
+            node, self.node_1.pubkey, self.node_2.pubkey
+        )))
     }
 }
 
@@ -767,6 +827,7 @@ impl<T: SimNetwork + Send + Sync> LightningNode for SimNode<T> {
         let preimage_bytes = Sha256::hash(&preimage.0[..]).to_byte_array();
         let payment_hash = PaymentHash(preimage_bytes);
 
+        log::info!("CKC adding receiver: {:?}", payment_receiver.try_recv());
         self.in_flight.insert(payment_hash, payment_receiver);
 
         Ok(payment_hash)
@@ -779,8 +840,11 @@ impl<T: SimNetwork + Send + Sync> LightningNode for SimNode<T> {
         hash: PaymentHash,
         listener: Listener,
     ) -> Result<PaymentResult, LightningError> {
+        log::info!("CKC trackpayment for {}", hex::encode(hash.0));
+
         match self.in_flight.get_mut(&hash) {
             Some(receiver) => {
+                log::info!("CKC adding receiver: {:?}", receiver.try_recv());
                 select! {
                     biased;
                     _ = listener => Err(LightningError::TrackPaymentError("shutdown during payment tracking".to_string())),
