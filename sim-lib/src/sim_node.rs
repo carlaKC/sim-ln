@@ -560,7 +560,6 @@ impl ChannelParticipant {
         cltv_expiry_delta: u32,
         base_fee: u64,
         fee_rate_prop: u64,
-        initiator: bool,
         capacity: u64,
     ) -> Self {
         ChannelParticipant {
@@ -569,7 +568,7 @@ impl ChannelParticipant {
             max_in_flight_msat: max_in_flight,
             min_htlc_size_msat: min_htlc_size,
             max_htlc_size_msat: max_htlc_size,
-            local_balance_msat: if initiator { capacity } else { 0 },
+            local_balance_msat: capacity/2,
             in_flight: HashMap::new(),
             cltv_expiry_delta,
             base_fee,

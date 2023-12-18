@@ -193,7 +193,6 @@ async fn main() -> anyhow::Result<()> {
         40,
         1000,
         1,
-        true,
         capacity,
     );
 
@@ -208,7 +207,6 @@ async fn main() -> anyhow::Result<()> {
         40,
         1000,
         1,
-        false,
         capacity,
     );
 
@@ -221,7 +219,6 @@ async fn main() -> anyhow::Result<()> {
         40,
         1000,
         1,
-        true,
         capacity,
     );
 
@@ -236,7 +233,6 @@ async fn main() -> anyhow::Result<()> {
         15,
         2000,
         1,
-        false,
         capacity,
     );
 
