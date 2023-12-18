@@ -6,6 +6,7 @@ use bitcoin::{secp256k1::PublicKey, Network};
 use bitcoin_ldk::blockdata::constants::genesis_block;
 use bitcoin_ldk::blockdata::script::Script;
 use bitcoin_ldk::{BlockHash, TxOut};
+use core::fmt;
 use lightning::ln::chan_utils::make_funding_redeemscript;
 use lightning::ln::features::{ChannelFeatures, NodeFeatures};
 use lightning::ln::msgs::UnsignedChannelUpdate;
@@ -19,6 +20,7 @@ use lightning::routing::utxo::{UtxoLookup, UtxoResult};
 use lightning::util::logger::{Level, Logger, Record};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::select;
@@ -39,14 +41,42 @@ pub enum ForwardingError {
     ChannelNotFound(u64),
     NodeNotFound(PublicKey),
     PaymentHashExists(PaymentHash),
+    // htlc amount / local balance
     InsufficientBalance(u64, u64),
+    // htlc amount / minimum
     LessThanMinimum(u64, u64),
+    // htlc amount /maximum
     MoreThanMaximum(u64, u64),
+    // total in flight / max in flight
     ExceedsInFlightCount(u64, u64),
+    // htlc amount / total in flight / max in flight
     ExceedsInFlightTotal(u64, u64, u64),
     ExpiryInSeconds(u32),
+    // cltv delta / minimum delta
     InsufficientCltvDelta(u32, u32),
-    InsufficientFee(u64, u64, u64),
+    //
+    InsufficientFee(u64, u64, u64, f64),
+}
+
+impl Display for ForwardingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ForwardingError::ZeroAmountHtlc => write!(f, "zero amount htlc"),
+            ForwardingError::ChannelNotFound(chan_id) => write!(f, "channel {chan_id} not found"),
+			ForwardingError::NodeNotFound(node) => write!(f, "node: {node} not found"),
+            ForwardingError::PaymentHashExists(hash) => {
+                write!(f, "payment hash {} already forwarded", hex::encode(hash.0))
+            }
+			ForwardingError::InsufficientBalance(htlc_amt, local_bal) => write!(f, "local balance: {local_bal} insufficient for htlc: {htlc_amt}"),
+			ForwardingError::LessThanMinimum(htlc_amt,min_amt ) => write!(f, "channel minimum: {min_amt} > htlc: {htlc_amt}"),
+			ForwardingError::MoreThanMaximum(htlc_amt,max_amt )=> write!(f,"channel maximum: {max_amt} < htlc: {htlc_amt}"),
+			ForwardingError::ExceedsInFlightCount(in_flight, max_in_flight ) => write!(f, "maximum in flight count: {max_in_flight} reached with {in_flight} htlcs"),
+			ForwardingError::ExceedsInFlightTotal(htlc_amt, in_flight_amt, max_in_flight) => write!(f, "maximum in flight amount: {max_in_flight} with {in_flight_amt} in flight exceeded by htlc: {htlc_amt}"),
+			ForwardingError::ExpiryInSeconds(cltv_delta) => write!(f, "cltv: {cltv_delta} expressed in seconds"),
+			ForwardingError::InsufficientCltvDelta(cltv_delta, min_delta ) => write!(f, "minimum cltv delta: {min_delta} not met by: {cltv_delta}"),
+			ForwardingError::InsufficientFee(htlc_fee, base_fee, prop_fee, expected_fee) => write!(f,"expected fee: {expected_fee} (base: {base_fee}, prop: {prop_fee}), got: {htlc_fee}"),
+        }
+    }
 }
 
 /// Graph is the top level struct that is used to coordinate simulation of lightning nodes.
@@ -602,6 +632,7 @@ impl ChannelParticipant {
                 fee,
                 self.base_fee,
                 self.fee_rate_prop,
+                expected_fee,
             ));
         }
 
