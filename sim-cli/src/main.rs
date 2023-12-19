@@ -1,5 +1,5 @@
 use bitcoin::secp256k1::PublicKey;
-use sim_lib::sim_node::{ln_node_from_graph, ChannelParticipant, Graph, SimChannel};
+use sim_lib::sim_node::{ln_node_from_graph, ChannelParticipant, Graph, SimulatedChannel};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -236,14 +236,14 @@ async fn main() -> anyhow::Result<()> {
         capacity,
     );
 
-    let chan_alice_bob = SimChannel {
+    let chan_alice_bob = SimulatedChannel {
         capacity_msat: capacity,
         short_channel_id: 123,
         node_1: alice_to_bob,
         node_2: bob_to_alice,
     };
 
-    let chan_bob_carol = SimChannel {
+    let chan_bob_carol = SimulatedChannel {
         capacity_msat: capacity,
         short_channel_id: 456,
         node_1: bob_to_carol,

@@ -1,11 +1,12 @@
 use crate::{LightningError, LightningNode, NodeInfo, PaymentOutcome, PaymentResult};
 use async_trait::async_trait;
-use bitcoin::hashes::sha256::Hash as Sha256;
-use bitcoin::hashes::Hash;
+use bitcoin::hashes::{sha256::Hash as Sha256, Hash};
 use bitcoin::{secp256k1::PublicKey, Network};
-use bitcoin_ldk::blockdata::constants::genesis_block;
-use bitcoin_ldk::blockdata::script::Script;
-use bitcoin_ldk::{BlockHash, TxOut};
+// LDK uses a different version of bitcoin library than us, so we alias the types it use to allow use of both versions.
+use bitcoin_ldk::{
+    blockdata::{constants::genesis_block, script::Script},
+    BlockHash, TxOut,
+};
 use core::fmt;
 use lightning::ln::chan_utils::make_funding_redeemscript;
 use lightning::ln::features::{ChannelFeatures, NodeFeatures};
@@ -32,26 +33,35 @@ use tokio::task::JoinSet;
 use triggered::Listener;
 
 #[derive(Debug)]
+/// ForwardingError represents the various errors that we can run into when forwarding payments in a simulated network.
+/// Since we're not using real lightning nodes, these errors are not obfuscated and can be propagated to the sending
+/// node and used for analysis.
 pub enum ForwardingError {
-    // TODO: make sure ordering is consistent and add custom display (?).
+    /// Zero amount htlcs are in valid in the protocol.
     ZeroAmountHtlc,
+    /// The outgoing channel id was not found in the network graph.
     ChannelNotFound(u64),
+    /// The node pubkey provided was not associated with the channel in the network graph.
     NodeNotFound(PublicKey),
+    /// The channel has already forwarded a HTLC with the payment hash provided (to be removed when MPP support is
+    /// added).
     PaymentHashExists(PaymentHash),
-    // htlc amount / local balance
+    /// The forwarding node did not have sufficient outgoing balance to forward the htlc (htlc amount / balance).
     InsufficientBalance(u64, u64),
-    // htlc amount / minimum
+    /// The htlc forwarded is less than the channel's advertised minimum htlc amount (htlc amount / minimum).
     LessThanMinimum(u64, u64),
-    // htlc amount /maximum
+    /// The htlc forwarded is more than the chanenl's advertised maximum htlc amount (htlc amount / maximum).
     MoreThanMaximum(u64, u64),
-    // total in flight / max in flight
+    /// The channel has reached its maximum allowable number of htlcs in flight (total in flight / maximim).
     ExceedsInFlightCount(u64, u64),
-    // htlc amount / total in flight / max in flight
+    /// The forwarded htlc's amount would push the channel over its maximum allowable in flight total
+    /// (htlc amount / total in flight / maximum).
     ExceedsInFlightTotal(u64, u64, u64),
+    /// The forwarded htlc's cltv expiry exceeds the maximum value used to express block heights in bitcoin.
     ExpiryInSeconds(u32),
-    // cltv delta / minimum delta
+    /// The forwarded htlc has insufficient cltv delta for the channel's minimum delta (cltv delta / minimum).
     InsufficientCltvDelta(u32, u32),
-    // fee / base / prop / expected
+    /// The forwarded htlc has insufficient fee for the channel's policy (fee / base fee / prop fee / expected fee).
     InsufficientFee(u64, u64, u64, u64),
 }
 
@@ -61,9 +71,7 @@ impl Display for ForwardingError {
             ForwardingError::ZeroAmountHtlc => write!(f, "zero amount htlc"),
             ForwardingError::ChannelNotFound(chan_id) => write!(f, "channel {chan_id} not found"),
 			ForwardingError::NodeNotFound(node) => write!(f, "node: {node} not found"),
-            ForwardingError::PaymentHashExists(hash) => {
-                write!(f, "payment hash {} already forwarded", hex::encode(hash.0))
-            }
+            ForwardingError::PaymentHashExists(hash) => write!(f, "payment hash {} already forwarded", hex::encode(hash.0)),
 			ForwardingError::InsufficientBalance(htlc_amt, local_bal) => write!(f, "local balance: {local_bal} insufficient for htlc: {htlc_amt}"),
 			ForwardingError::LessThanMinimum(htlc_amt,min_amt ) => write!(f, "channel minimum: {min_amt} > htlc: {htlc_amt}"),
 			ForwardingError::MoreThanMaximum(htlc_amt,max_amt )=> write!(f,"channel maximum: {max_amt} < htlc: {htlc_amt}"),
@@ -78,21 +86,22 @@ impl Display for ForwardingError {
 
 /// Graph is the top level struct that is used to coordinate simulation of lightning nodes.
 pub struct Graph<'a> {
-    // nodes caches the list of nodes in the network with a vector of their channel capacities.
+    /// nodes caches the list of nodes in the network with a vector of their channel capacities, only used for quick
+    /// lookup.
     nodes: HashMap<PublicKey, Vec<u64>>,
 
-    // channels maps the scid of a channel to its current state.
-    channels: Arc<Mutex<HashMap<u64, SimChannel>>>,
+    /// channels maps the scid of a channel to its current simulation state.
+    channels: Arc<Mutex<HashMap<u64, SimulatedChannel>>>,
 
-    // track all tasks spawned to process payments in the graph.
+    /// track all tasks spawned to process payments in the graph.
     tasks: JoinSet<()>,
 
-    // a network graph used for pathfinding.
+    /// a read-only network graph used for pathfinding.
     graph: NetworkGraph<&'a WrappedLog>,
 }
 
 impl Graph<'_> {
-    pub fn new(graph_channels: Vec<SimChannel>) -> Result<Self, LdkError> {
+    pub fn new(graph_channels: Vec<SimulatedChannel>) -> Result<Self, LdkError> {
         let mut nodes: HashMap<PublicKey, Vec<u64>> = HashMap::new();
         let mut channels = HashMap::new();
 
@@ -114,7 +123,7 @@ impl Graph<'_> {
             insert_node_entry!(channel.node_2.pubkey);
         }
 
-        let graph = create_routing_graph(graph_channels)?;
+        let graph = populate_network_graph(graph_channels)?;
 
         Ok(Graph {
             nodes,
@@ -125,6 +134,7 @@ impl Graph<'_> {
     }
 }
 
+/// Produces a map of node public key to lightning node implementation to be used for simulations.
 pub async fn ln_node_from_graph(
     graph: Arc<Mutex<Graph<'_>>>,
 ) -> HashMap<PublicKey, Arc<Mutex<dyn LightningNode + Send + '_>>> {
@@ -137,14 +147,15 @@ pub async fn ln_node_from_graph(
     nodes
 }
 
-fn create_routing_graph(
-    channels: Vec<SimChannel>,
+/// Populates a network graph based on the set of simulated channels provided. This function *only* applies channel
+/// announcements, which has the effect of adding the nodes in each channel to the graph, because LDK does not export
+/// all of the fields required to apply node announcements. This means that we will not have node-level information
+/// (such as features) available in the routing graph.
+fn populate_network_graph(
+    channels: Vec<SimulatedChannel>,
 ) -> Result<NetworkGraph<&'static WrappedLog>, LdkError> {
     let graph = NetworkGraph::new(bitcoin_ldk::Network::Regtest, &WrappedLog {});
 
-    // Add all the channels provided to our graph. This will also add the nodes to our network graph because ldk adds
-    // any missing nodes to its view. Note that the graph will not have "node level" information, such as supported
-    // features because we are not providing it with individual node announcements.
     let chain_hash = genesis_block(bitcoin_ldk::Network::Regtest)
         .header
         .block_hash();
@@ -154,15 +165,17 @@ fn create_routing_graph(
         let node_2_pk = ldk_pubkey(channel.node_2.pubkey);
 
         let announcement = UnsignedChannelAnnouncement {
-            features: ChannelFeatures::empty(), // TODO: check whether we need any features (new onion?)
+            // For our purposes we don't currently need any channel level features.
+            features: ChannelFeatures::empty(),
             chain_hash,
             short_channel_id: channel.short_channel_id,
             node_id_1: NodeId::from_pubkey(&node_1_pk),
             node_id_2: NodeId::from_pubkey(&node_2_pk),
             // Note: we don't need bitcoin keys for our purposes, so we just copy them *but* remember that we do use
-            // this for our fake utxo validation so they do matter.
+            // this for our fake utxo validation so they do matter for producing the script that we mock validate.
             bitcoin_key_1: NodeId::from_pubkey(&node_1_pk),
             bitcoin_key_2: NodeId::from_pubkey(&node_2_pk),
+            // Internal field used by LDK, we don't need it.
             excess_data: Vec::new(),
         };
 
@@ -192,6 +205,8 @@ fn create_routing_graph(
             }};
         }
 
+        // The least significant bit of the channel flag field represents the direction that the channel update
+        // applies to. This value is interpreted as node_1 if it is zero, and node_2 otherwise.
         generate_and_update_channel!(channel.node_1, 0);
         generate_and_update_channel!(channel.node_2, 1);
     }
@@ -201,6 +216,7 @@ fn create_routing_graph(
 
 /// Produces the node info for a mocked node, filling in the features that the simulator requires.
 fn node_info(pk: PublicKey) -> NodeInfo {
+    // Set any features that the simulator requires here.
     let mut features = NodeFeatures::empty();
     features.set_keysend_optional();
 
@@ -211,24 +227,24 @@ fn node_info(pk: PublicKey) -> NodeInfo {
     }
 }
 
+/// WrappedLog implements LDK's logging trait so that we can provide pathfinding with a logger that uses our existing
+/// logger.
 struct WrappedLog {}
 
 impl Logger for WrappedLog {
-    // TODO: better log, ideally just imported. Must have levels + formatted args.
     fn log(&self, record: &Record) {
         match record.level {
+            Level::Gossip => log::trace!("{}", record.args),
             Level::Trace => log::trace!("{}", record.args),
             Level::Debug => log::debug!("{}", record.args),
             Level::Info => log::info!("{}", record.args),
             Level::Warn => log::warn!("{}", record.args),
             Level::Error => log::error!("{}", record.args),
-            _ => log::trace!("{}", record.args),
         }
     }
 }
 
-// UtxoValidator is a faked utxo validator that just returns a fake output with the desired
-// capacity for a channel.
+/// UtxoValidator is a mock utxo validator that just returns a fake output with the desired capacity for a channel.
 struct UtxoValidator {
     amount_sat: u64,
     script: Script,
@@ -284,8 +300,10 @@ impl SimNetwork for Graph<'_> {
                         final_cltv_expiry_delta: 0,
                     },
                     expiry_time: None,
-                    max_total_cltv_expiry_delta: 100000, // TODO real number
-                    max_path_count: 1,                   // TODO MPP?
+                    max_total_cltv_expiry_delta: u32::MAX,
+                    // TODO: set non-zero value to support MPP.
+                    max_path_count: 1,
+                    // Allow sending htlcs up to 50% of the channel's capacity.
                     max_channel_saturation_power_of_half: 1,
                     previously_failed_channels: Vec::new(),
                 },
@@ -356,8 +374,10 @@ impl SimNetwork for Graph<'_> {
     }
 }
 
+/// Adds htlcs to the simulation state along the path provided. Returning the index in the path from which to fail
+/// back htlcs (if any) and a forwading error if the payment is not successfully added to the entire path.
 async fn add_htlcs(
-    nodes: Arc<Mutex<HashMap<u64, SimChannel>>>,
+    nodes: Arc<Mutex<HashMap<u64, SimulatedChannel>>>,
     source: PublicKey,
     route: Path,
     payment_hash: PaymentHash,
@@ -372,7 +392,6 @@ async fn add_htlcs(
     let mut fail_idx = None;
 
     log::info!("CKC: add_htlcs - adding htlcs");
-    // Lookup each hop in the route and add the HTLC to its mock channel.
     for (i, hop) in route.hops.iter().enumerate() {
         let pubkey_str = format!("{}", hop.pubkey);
         let hop_pubkey = PublicKey::from_str(&pubkey_str).unwrap();
@@ -406,18 +425,19 @@ async fn add_htlcs(
                 // Once we've added the HTLC on this hop's channel, we want to check whether it has sufficient fee
                 // and CLTV delta per the _next_ channel's policy (because fees and CLTV delta in LN are charged on
                 // the outgoing link). We check the policy belonging to the node that we just forwarded to, which
-                // represents the fee in that direction. Note that we don't check the final hop's requirements for CLTV
-                // delta, that's out of scope at present.
+                // represents the fee in that direction.
+                //
+                // Note that we don't check the final hop's requirements for CLTV delta at present.
                 if i != route.hops.len() - 1 {
                     if let Some(channel) = node_lock.get(&route.hops[i + 1].short_channel_id) {
                         if let Err(e) = channel.check_htlc_forward(
                             hop_pubkey,
                             hop.cltv_expiry_delta,
-                            outgoing_amount - hop.fee_msat, // TODO: check the amount that we calc fee on
+                            outgoing_amount - hop.fee_msat,
                             hop.fee_msat,
                         ) {
                             // If we haven't met forwarding conditions for the next channel's policy, then we fail at
-                            // index i, because we've already added the HTLC as outgoing.
+                            // the current index, because we've already added the HTLC as outgoing.
                             return Err((fail_idx, e));
                         }
                     }
@@ -436,14 +456,15 @@ async fn add_htlcs(
         outgoing_amount -= hop.fee_msat;
         outgoing_cltv -= hop.cltv_expiry_delta;
 
-        // TODO: latency?
+        // TODO: introduce artificial latency between hops?
     }
 
     Ok(())
 }
 
+/// Removes htlcs from the simulation state from the index in the path provided _backwards_.
 async fn remove_htlcs(
-    nodes: Arc<Mutex<HashMap<u64, SimChannel>>>,
+    nodes: Arc<Mutex<HashMap<u64, SimulatedChannel>>>,
     resolution_idx: usize,
     source: PublicKey,
     route: Path,
@@ -454,13 +475,13 @@ async fn remove_htlcs(
     for i in resolution_idx..0 {
         let hop = &route.hops[i];
 
+        // When we add HTLCs, we do so on the state of the node that sent the htlc along the channel so we need to
+        // look up our incoming node so that we can remove it when we go backwards. For the first htlc, this is just
+        // the sending node, otherwise it's the hop before.
         let incoming_node = if i == 0 {
             source
         } else {
-            // Note: this is a _hideous_ workaround for the fact that we're using a different
-            // version of bitcoin dep than LDK.
-            let pubkey_str = format!("{}", route.hops[i - 1].pubkey);
-            PublicKey::from_str(&pubkey_str).unwrap()
+            local_pubkey(route.hops[i - 1].pubkey)
         };
 
         match nodes.lock().await.get_mut(&hop.short_channel_id) {
@@ -489,7 +510,7 @@ async fn remove_htlcs(
 }
 
 async fn propagate_payment(
-    nodes: Arc<Mutex<HashMap<u64, SimChannel>>>,
+    nodes: Arc<Mutex<HashMap<u64, SimulatedChannel>>>,
     source: PublicKey,
     route: Path,
     preimage: PaymentPreimage,
@@ -562,7 +583,7 @@ struct Htlc {
 }
 
 #[derive(Clone)]
-pub struct SimChannel {
+pub struct SimulatedChannel {
     pub capacity_msat: u64,
     pub short_channel_id: u64,
     pub node_1: ChannelParticipant,
@@ -710,7 +731,7 @@ impl ChannelParticipant {
     }
 }
 
-impl SimChannel {
+impl SimulatedChannel {
     fn add_htlc(&mut self, node: PublicKey, htlc: Htlc) -> Result<(), ForwardingError> {
         if htlc.amount_msat == 0 {
             return Err(ForwardingError::ZeroAmountHtlc);
@@ -899,7 +920,13 @@ impl<T: SimNetwork + Send + Sync> LightningNode for SimNode<T> {
     }
 }
 
-// workaround to get ldk types pubkeys
+// A workaround to convert the bitcoin::PublicKey version we're using to the bitcoin::PublicKey type that LDK is using.
 fn ldk_pubkey(pk: PublicKey) -> bitcoin_ldk::secp256k1::PublicKey {
     bitcoin_ldk::secp256k1::PublicKey::from_str(&pk.to_string()).unwrap()
+}
+
+// A workaround to convert the bitcoin::PublicKey version that LDK is using to the bitcoin::PublicKey type that we're
+// using.
+fn local_pubkey(pk: bitcoin_ldk::secp256k1::PublicKey) -> PublicKey {
+    PublicKey::from_str(&format!("{}", pk)).unwrap()
 }
