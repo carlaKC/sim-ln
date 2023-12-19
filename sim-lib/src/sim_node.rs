@@ -119,8 +119,8 @@ impl Graph<'_> {
                 }};
             }
 
-            insert_node_entry!(channel.node_1.pubkey);
-            insert_node_entry!(channel.node_2.pubkey);
+            insert_node_entry!(channel.node_1.policy.pubkey);
+            insert_node_entry!(channel.node_2.policy.pubkey);
         }
 
         let graph = populate_network_graph(graph_channels)?;
@@ -161,8 +161,8 @@ fn populate_network_graph(
         .block_hash();
 
     for channel in channels {
-        let node_1_pk = ldk_pubkey(channel.node_1.pubkey);
-        let node_2_pk = ldk_pubkey(channel.node_2.pubkey);
+        let node_1_pk = ldk_pubkey(channel.node_1.policy.pubkey);
+        let node_2_pk = ldk_pubkey(channel.node_2.policy.pubkey);
 
         let announcement = UnsignedChannelAnnouncement {
             // For our purposes we don't currently need any channel level features.
@@ -193,11 +193,11 @@ fn populate_network_graph(
                     short_channel_id: channel.short_channel_id,
                     timestamp: 1702667117, // TODO: current time
                     flags: $flags,         // TODO: double check
-                    cltv_expiry_delta: $node.cltv_expiry_delta as u16,
-                    htlc_minimum_msat: $node.min_htlc_size_msat,
-                    htlc_maximum_msat: $node.max_htlc_size_msat,
-                    fee_base_msat: $node.base_fee as u32,
-                    fee_proportional_millionths: $node.fee_rate_prop as u32,
+                    cltv_expiry_delta: $node.policy.cltv_expiry_delta as u16,
+                    htlc_minimum_msat: $node.policy.min_htlc_size_msat,
+                    htlc_maximum_msat: $node.policy.max_htlc_size_msat,
+                    fee_base_msat: $node.policy.base_fee as u32,
+                    fee_proportional_millionths: $node.policy.fee_rate_prop as u32,
                     excess_data: Vec::new(),
                 };
 
@@ -462,7 +462,7 @@ async fn add_htlcs(
     Ok(())
 }
 
-/// Removes htlcs from the simulation state from the index in the path provided _backwards_.
+/// Removes htlcs from the simulation state from the index in the path provided (backwards).
 async fn remove_htlcs(
     nodes: Arc<Mutex<HashMap<u64, SimulatedChannel>>>,
     resolution_idx: usize,
@@ -490,6 +490,7 @@ async fn remove_htlcs(
                     .remove_htlc(incoming_node, payment_hash, success)
                     .is_err()
                 {
+                    // TODO: signal critical error, we should always find our htlcs.
                     return Err(LightningError::SendPaymentError(format!(
                         "could not remove htlc {} from {}",
                         hex::encode(payment_hash.0),
@@ -498,6 +499,7 @@ async fn remove_htlcs(
                 }
             }
             None => {
+                // TODO: signal critical error, we should always find channels we've already used.
                 return Err(LightningError::SendPaymentError(format!(
                     "successfully added HTLC not found on resolution: {}",
                     hop.short_channel_id
@@ -509,6 +511,8 @@ async fn remove_htlcs(
     Ok(())
 }
 
+/// Finds a payment path from the source to destination nodes provided, and propagates the appropriate htlcs through
+/// the simulated network, notifying the sender channel provided of the payment outcome.
 async fn propagate_payment(
     nodes: Arc<Mutex<HashMap<u64, SimulatedChannel>>>,
     source: PublicKey,
@@ -583,50 +587,33 @@ struct Htlc {
 }
 
 #[derive(Clone)]
-pub struct SimulatedChannel {
-    pub capacity_msat: u64,
-    pub short_channel_id: u64,
-    pub node_1: ChannelParticipant,
-    pub node_2: ChannelParticipant,
+/// Represents one node in the channel's forwarding policy and restrictions. Note that this doesn't directly map to
+/// a single concept in the protocol, a few things have been combined for the sake of simplicity.
+pub struct ChannelPolicy {
+    pub pubkey: PublicKey,
+    pub max_htlc_count: u64,
+    pub max_in_flight_msat: u64,
+    pub min_htlc_size_msat: u64,
+    pub max_htlc_size_msat: u64,
+    pub cltv_expiry_delta: u32,
+    pub base_fee: u64,
+    pub fee_rate_prop: u64,
 }
 
+/// The internal state of one side of a simulated channel.
 #[derive(Clone)]
-pub struct ChannelParticipant {
-    pubkey: PublicKey,
-    max_htlc_count: u64,
-    max_in_flight_msat: u64,
-    min_htlc_size_msat: u64,
-    max_htlc_size_msat: u64,
+struct ChannelState {
     local_balance_msat: u64,
     in_flight: HashMap<PaymentHash, Htlc>,
-    cltv_expiry_delta: u32,
-    base_fee: u64,
-    fee_rate_prop: u64,
+    policy: ChannelPolicy,
 }
 
-impl ChannelParticipant {
-    pub fn new(
-        pubkey: PublicKey,
-        max_htlc_count: u64,
-        max_in_flight: u64,
-        min_htlc_size: u64,
-        max_htlc_size: u64,
-        cltv_expiry_delta: u32,
-        base_fee: u64,
-        fee_rate_prop: u64,
-        capacity: u64,
-    ) -> Self {
-        ChannelParticipant {
-            pubkey,
-            max_htlc_count,
-            max_in_flight_msat: max_in_flight,
-            min_htlc_size_msat: min_htlc_size,
-            max_htlc_size_msat: max_htlc_size,
-            local_balance_msat: capacity / 2,
+impl ChannelState {
+    fn new(policy: ChannelPolicy, capacity_msat: u64) -> Self {
+        ChannelState {
+            local_balance_msat: capacity_msat / 2,
             in_flight: HashMap::new(),
-            cltv_expiry_delta,
-            base_fee,
-            fee_rate_prop,
+            policy,
         }
     }
 
@@ -637,21 +624,22 @@ impl ChannelParticipant {
     }
 
     fn check_forward(&self, cltv_delta: u32, amt: u64, fee: u64) -> Result<(), ForwardingError> {
-        if cltv_delta < self.cltv_expiry_delta {
+        if cltv_delta < self.policy.cltv_expiry_delta {
             return Err(ForwardingError::InsufficientCltvDelta(
                 cltv_delta,
-                self.cltv_expiry_delta,
+                self.policy.cltv_expiry_delta,
             ));
         }
 
         // As u64 will round expected fee down to nearest msat.
-        let expected_fee =
-            (self.base_fee as f64 + ((self.fee_rate_prop as f64 * amt as f64) / 1000000.0)) as u64;
+        let expected_fee = (self.policy.base_fee as f64
+            + ((self.policy.fee_rate_prop as f64 * amt as f64) / 1000000.0))
+            as u64;
         if fee < expected_fee {
             return Err(ForwardingError::InsufficientFee(
                 fee,
-                self.base_fee,
-                self.fee_rate_prop,
+                self.policy.base_fee,
+                self.policy.fee_rate_prop,
                 expected_fee,
             ));
         }
@@ -667,32 +655,32 @@ impl ChannelParticipant {
             ));
         }
 
-        if htlc.amount_msat < self.min_htlc_size_msat {
+        if htlc.amount_msat < self.policy.min_htlc_size_msat {
             return Err(ForwardingError::LessThanMinimum(
                 htlc.amount_msat,
-                self.min_htlc_size_msat,
+                self.policy.min_htlc_size_msat,
             ));
         }
 
-        if htlc.amount_msat > self.max_htlc_size_msat {
+        if htlc.amount_msat > self.policy.max_htlc_size_msat {
             return Err(ForwardingError::MoreThanMaximum(
                 htlc.amount_msat,
-                self.max_htlc_size_msat,
+                self.policy.max_htlc_size_msat,
             ));
         }
 
-        if self.in_flight.len() as u64 + 1 > self.max_htlc_count {
+        if self.in_flight.len() as u64 + 1 > self.policy.max_htlc_count {
             return Err(ForwardingError::ExceedsInFlightCount(
                 self.in_flight.len() as u64,
-                self.max_htlc_count,
+                self.policy.max_htlc_count,
             ));
         }
 
-        if self.in_flight_total() + htlc.amount_msat > self.max_in_flight_msat {
+        if self.in_flight_total() + htlc.amount_msat > self.policy.max_in_flight_msat {
             return Err(ForwardingError::ExceedsInFlightTotal(
                 htlc.amount_msat,
                 self.in_flight_total(),
-                self.max_in_flight_msat,
+                self.policy.max_in_flight_msat,
             ));
         }
 
@@ -731,19 +719,44 @@ impl ChannelParticipant {
     }
 }
 
+#[derive(Clone)]
+pub struct SimulatedChannel {
+    capacity_msat: u64,
+    short_channel_id: u64,
+    node_1: ChannelState,
+    node_2: ChannelState,
+}
+
 impl SimulatedChannel {
+    pub fn new(
+        capacity_msat: u64,
+        short_channel_id: u64,
+        node_1: ChannelPolicy,
+        node_2: ChannelPolicy,
+    ) -> Self {
+        SimulatedChannel {
+            capacity_msat,
+            short_channel_id,
+            node_1: ChannelState::new(node_1, capacity_msat),
+            node_2: ChannelState::new(node_2, capacity_msat),
+        }
+    }
+}
+
+impl SimulatedChannel {
+    /// Adds a htlc to the appropriate side of the simulated channel, checking its policy and balance are okay.
     fn add_htlc(&mut self, node: PublicKey, htlc: Htlc) -> Result<(), ForwardingError> {
         if htlc.amount_msat == 0 {
             return Err(ForwardingError::ZeroAmountHtlc);
         }
 
-        if node == self.node_1.pubkey {
+        if node == self.node_1.policy.pubkey {
             let res = self.node_1.add_outgoing_htlc(htlc);
             self.sanity_check();
             return res;
         }
 
-        if node == self.node_2.pubkey {
+        if node == self.node_2.policy.pubkey {
             let res = self.node_2.add_outgoing_htlc(htlc);
             self.sanity_check();
             return res;
@@ -752,7 +765,7 @@ impl SimulatedChannel {
         Err(ForwardingError::NodeNotFound(node))
     }
 
-    /// performs a sanity check on the total balances in a channel. Note that we do not currently include on-chain
+    /// Performs a sanity check on the total balances in a channel. Note that we do not currently include on-chain
     /// fees or reserve so these values should exactly match.
     fn sanity_check(&self) {
         let node_1_total = self.node_1.local_balance_msat + self.node_1.in_flight_total();
@@ -766,6 +779,8 @@ impl SimulatedChannel {
         }
     }
 
+    /// Removes a htlc from the appropriate size of the simulated channel, settling balances across channel sides
+    /// based on the success of the htlc.
     fn remove_htlc(
         &mut self,
         incoming_node: PublicKey,
@@ -773,7 +788,7 @@ impl SimulatedChannel {
         success: bool,
     ) -> Result<(), ()> {
         // TODO: macro for this?
-        if incoming_node == self.node_1.pubkey {
+        if incoming_node == self.node_1.policy.pubkey {
             if let Ok(htlc) = self.node_1.remove_outgoing_htlc(hash, success) {
                 // If the HTLC was settled, its amount is transferred to the remote party's local balance.
                 // If it was failed, the above removal has already dealt with balance management.
@@ -788,7 +803,7 @@ impl SimulatedChannel {
             }
         }
 
-        if incoming_node == self.node_2.pubkey {
+        if incoming_node == self.node_2.policy.pubkey {
             if let Ok(htlc) = self.node_2.remove_outgoing_htlc(hash, success) {
                 // If the HTLC was settled, its amount is transferred to the remote party's local balance.
                 // If it was failed, the above removal has already dealt with balance management.
@@ -806,6 +821,7 @@ impl SimulatedChannel {
         Err(())
     }
 
+    /// Checks a htlc forward against the outgoing policy of the node provided.
     fn check_htlc_forward(
         &self,
         node: PublicKey,
@@ -813,11 +829,11 @@ impl SimulatedChannel {
         amount_msat: u64,
         fee_msat: u64,
     ) -> Result<(), ForwardingError> {
-        if node == self.node_1.pubkey {
+        if node == self.node_1.policy.pubkey {
             return self.node_1.check_forward(cltv_delta, amount_msat, fee_msat);
         }
 
-        if node == self.node_2.pubkey {
+        if node == self.node_2.policy.pubkey {
             return self.node_2.check_forward(cltv_delta, amount_msat, fee_msat);
         }
 
@@ -920,13 +936,13 @@ impl<T: SimNetwork + Send + Sync> LightningNode for SimNode<T> {
     }
 }
 
-// A workaround to convert the bitcoin::PublicKey version we're using to the bitcoin::PublicKey type that LDK is using.
+/// A workaround to convert the bitcoin::PublicKey version we're using to the bitcoin::PublicKey type that LDK is using.
 fn ldk_pubkey(pk: PublicKey) -> bitcoin_ldk::secp256k1::PublicKey {
     bitcoin_ldk::secp256k1::PublicKey::from_str(&pk.to_string()).unwrap()
 }
 
-// A workaround to convert the bitcoin::PublicKey version that LDK is using to the bitcoin::PublicKey type that we're
-// using.
+/// A workaround to convert the bitcoin::PublicKey version that LDK is using to the bitcoin::PublicKey type that we're
+/// using.
 fn local_pubkey(pk: bitcoin_ldk::secp256k1::PublicKey) -> PublicKey {
     PublicKey::from_str(&format!("{}", pk)).unwrap()
 }
