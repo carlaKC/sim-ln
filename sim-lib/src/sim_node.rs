@@ -288,7 +288,6 @@ impl SimNetwork for Graph<'_> {
         let params = ProbabilisticScoringDecayParameters::default();
         let scorer = ProbabilisticScorer::new(params, &self.graph, &WrappedLog {});
 
-        log::info!("CKC: dispatch payment - finding route");
         let route = match find_route(
             &ldk_pubkey(source),
             &RouteParameters {
@@ -332,7 +331,6 @@ impl SimNetwork for Graph<'_> {
             }
         };
 
-        log::info!("CKC: dispatch payment - found route");
         // Since we're not supporting MPP, just grab the first path off our route. If we don't have at least one path,
         // log a warning - this is unexpected - and fail the payment.
         let path = match route.paths.first() {
@@ -351,7 +349,6 @@ impl SimNetwork for Graph<'_> {
             }
         };
 
-        log::info!("CKC: dispatch payment - spinning up task");
         self.tasks.spawn(propagate_payment(
             self.channels.clone(),
             source,
@@ -391,18 +388,11 @@ async fn add_htlcs(
 
     let mut fail_idx = None;
 
-    log::info!("CKC: add_htlcs - adding htlcs");
     for (i, hop) in route.hops.iter().enumerate() {
         let pubkey_str = format!("{}", hop.pubkey);
         let hop_pubkey = PublicKey::from_str(&pubkey_str).unwrap();
 
-        log::info!(
-            "CKC: add_htlcs - adding to channel {}",
-            hop.short_channel_id
-        );
-
         let mut node_lock = nodes.lock().await;
-
         match node_lock.get_mut(&hop.short_channel_id) {
             Some(channel) => {
                 if let Err(e) = channel.add_htlc(
@@ -471,7 +461,6 @@ async fn remove_htlcs(
     payment_hash: PaymentHash,
     success: bool,
 ) -> Result<(), LightningError> {
-    log::info!("CKC removing htlcs");
     for i in resolution_idx..0 {
         let hop = &route.hops[i];
 
@@ -523,10 +512,8 @@ async fn propagate_payment(
     let preimage_bytes = Sha256::hash(&preimage.0[..]).to_byte_array();
     let payment_hash = PaymentHash(preimage_bytes);
 
-    log::info!("CKC: propagate payment - adding htlcs");
     let notify_result = match add_htlcs(nodes.clone(), source, route.clone(), payment_hash).await {
         Ok(_) => {
-            log::info!("CKC: propagate payment - removing htlcs (success)");
             if let Err(e) = remove_htlcs(
                 nodes,
                 route.hops.len() - 1,
@@ -541,7 +528,6 @@ async fn propagate_payment(
                 log::error!("Could not remove successful htlc: {e}.");
             }
 
-            log::info!("CKC: propagate payment - removed htlcs (success)");
             PaymentResult {
                 htlc_count: 1,
                 payment_outcome: PaymentOutcome::Success,
@@ -573,7 +559,6 @@ async fn propagate_payment(
         }
     };
 
-    log::info!("CKC: propagate payment - sending notification");
     if let Err(e) = sender.send(Ok(notify_result)) {
         log::error!("Could not notify payment result: {:?}.", e);
     }
@@ -877,7 +862,6 @@ impl<T: SimNetwork + Send + Sync> LightningNode for SimNode<T> {
         amount_msat: u64,
     ) -> Result<PaymentHash, LightningError> {
         let preimage = PaymentPreimage(rand::random());
-        log::info!("CKC: send_payment - dispatching payment");
         let payment_receiver = self.network.lock().await.dispatch_payment(
             self.info.pubkey,
             dest,
@@ -885,7 +869,6 @@ impl<T: SimNetwork + Send + Sync> LightningNode for SimNode<T> {
             preimage,
         );
 
-        log::info!("CKC: send_payment - dispatched payment");
         let preimage_bytes = Sha256::hash(&preimage.0[..]).to_byte_array();
         let payment_hash = PaymentHash(preimage_bytes);
 
