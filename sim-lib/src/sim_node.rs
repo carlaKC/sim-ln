@@ -207,8 +207,8 @@ fn create_routing_graph(
             }};
         }
 
-        generate_and_update_channel!(channel.node_1, 1);
-        generate_and_update_channel!(channel.node_2, 0);
+        generate_and_update_channel!(channel.node_1, 0);
+        generate_and_update_channel!(channel.node_2, 1);
     }
 
     Ok(graph)
