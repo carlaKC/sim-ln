@@ -236,7 +236,13 @@ async fn main() -> anyhow::Result<()> {
 
     let chan_bob_carol = SimulatedChannel::new(capacity, 456, bob_to_carol, carol_to_bob);
 
-    let graph = match Graph::new(vec![chan_alice_bob, chan_bob_carol]) {
+    // TODO: use the shutdown trigger and listener across simulator and graph.
+    let (shutdown_trigger, shutdown_listener) = triggered::trigger();
+    let graph = match Graph::new(
+        vec![chan_alice_bob, chan_bob_carol],
+        shutdown_trigger,
+        shutdown_listener,
+    ) {
         Ok(graph) => Arc::new(Mutex::new(graph)),
         Err(e) => anyhow::bail!("failed: {:?}", e),
     };

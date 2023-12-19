@@ -30,7 +30,7 @@ use tokio::select;
 use tokio::sync::oneshot::{channel, Receiver, Sender};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
-use triggered::Listener;
+use triggered::{Listener, Trigger};
 
 #[derive(Debug)]
 /// ForwardingError represents the various errors that we can run into when forwarding payments in a simulated network.
@@ -98,10 +98,21 @@ pub struct Graph<'a> {
 
     /// a read-only network graph used for pathfinding.
     graph: NetworkGraph<&'a WrappedLog>,
+
+    /// trigger shutdown if a critical error occurs.
+    shutdown_trigger: Trigger,
+
+    /// signal shutdown if a critical error occurs.
+    shutdown_listener: Listener,
 }
 
 impl Graph<'_> {
-    pub fn new(graph_channels: Vec<SimulatedChannel>) -> Result<Self, LdkError> {
+    /// Creates a graph on which to simulate payments.
+    pub fn new(
+        graph_channels: Vec<SimulatedChannel>,
+        shutdown_trigger: Trigger,
+        shutdown_listener: Listener,
+    ) -> Result<Self, LdkError> {
         let mut nodes: HashMap<PublicKey, Vec<u64>> = HashMap::new();
         let mut channels = HashMap::new();
 
@@ -130,7 +141,22 @@ impl Graph<'_> {
             channels: Arc::new(Mutex::new(channels)),
             tasks: JoinSet::new(),
             graph,
+            shutdown_trigger,
+            shutdown_listener,
         })
+    }
+
+    /// A very simple run function that will simply wait for the signal to shutdown and wait for all tasks to finish.
+    pub async fn run(&mut self) {
+        log::debug!("Graph simulating payments, waiting for instruction to shutdown.");
+        self.shutdown_listener.clone().await;
+
+        log::debug!("Graph received signal to shutdown, waiting for tasks to exit.");
+        while let Some(res) = self.tasks.join_next().await {
+            if let Err(e) = res {
+                log::error!("Graph task exited with error: {e}");
+            }
+        }
     }
 }
 
@@ -361,6 +387,7 @@ impl SimNetwork for Graph<'_> {
             path.clone(),
             preimage,
             sender,
+            self.shutdown_trigger.clone(),
         ));
 
         receiver
@@ -458,7 +485,8 @@ async fn add_htlcs(
     Ok(())
 }
 
-/// Removes htlcs from the simulation state from the index in the path provided (backwards).
+/// Removes htlcs from the simulation state from the index in the path provided (backwards). Any error encountered here
+/// should be treated as critical, because it indicates that there has been a breakdown in the simulation state machine.
 async fn remove_htlcs(
     nodes: Arc<Mutex<HashMap<u64, SimulatedChannel>>>,
     resolution_idx: usize,
@@ -466,7 +494,7 @@ async fn remove_htlcs(
     route: Path,
     payment_hash: PaymentHash,
     success: bool,
-) -> Result<(), LightningError> {
+) -> Result<(), ()> {
     for i in resolution_idx..0 {
         let hop = &route.hops[i];
 
@@ -485,20 +513,23 @@ async fn remove_htlcs(
                     .remove_htlc(incoming_node, payment_hash, success)
                     .is_err()
                 {
-                    // TODO: signal critical error, we should always find our htlcs.
-                    return Err(LightningError::SendPaymentError(format!(
-                        "could not remove htlc {} from {}",
+                    log::error!(
+                        "Could not remove htlc: {} from channel: {}.",
                         hex::encode(payment_hash.0),
-                        hop.short_channel_id
-                    )));
+                        hop.short_channel_id,
+                    );
+
+                    return Err(());
                 }
             }
             None => {
-                // TODO: signal critical error, we should always find channels we've already used.
-                return Err(LightningError::SendPaymentError(format!(
-                    "successfully added HTLC not found on resolution: {}",
-                    hop.short_channel_id
-                )));
+                log::error!(
+                    "Could not remove htlc: {} channel not found: {}.",
+                    hex::encode(payment_hash.0),
+                    hop.short_channel_id,
+                );
+
+                return Err(());
             }
         }
     }
@@ -507,20 +538,24 @@ async fn remove_htlcs(
 }
 
 /// Finds a payment path from the source to destination nodes provided, and propagates the appropriate htlcs through
-/// the simulated network, notifying the sender channel provided of the payment outcome.
+/// the simulated network, notifying the sender channel provided of the payment outcome. If a critical error occurs,
+/// ie a breakdown of our state machine, it will still notify the payment outcome and will use the shutdown trigger
+/// to signal that we should exit.
 async fn propagate_payment(
     nodes: Arc<Mutex<HashMap<u64, SimulatedChannel>>>,
     source: PublicKey,
     route: Path,
     preimage: PaymentPreimage,
     sender: Sender<Result<PaymentResult, LightningError>>,
+    shutdown: Trigger,
 ) {
     let preimage_bytes = Sha256::hash(&preimage.0[..]).to_byte_array();
     let payment_hash = PaymentHash(preimage_bytes);
 
     let notify_result = match add_htlcs(nodes.clone(), source, route.clone(), payment_hash).await {
+        // If we successfully added the htlc, go ahead and remove all the htlcs in the route with successful resolution.
         Ok(_) => {
-            if let Err(e) = remove_htlcs(
+            if remove_htlcs(
                 nodes,
                 route.hops.len() - 1,
                 source,
@@ -529,9 +564,9 @@ async fn propagate_payment(
                 true,
             )
             .await
+            .is_err()
             {
-                // TODO: critical error, our state machine isn't working.
-                log::error!("Could not remove successful htlc: {e}.");
+                shutdown.trigger();
             }
 
             PaymentResult {
@@ -539,16 +574,16 @@ async fn propagate_payment(
                 payment_outcome: PaymentOutcome::Success,
             }
         }
+        // If we partially added HTLCs along the route, we need to fail them back to the source to clean up our
+        // partial state. It's possible that we failed with the very first add, and then we don't need to clean
+        // anything up.
         Err((fail_idx, err)) => {
-            // If we partially added HTLCs along the route, we need to fail them back to the source to clean up our
-            // partial state. It's possible that we failed with the very first add, and then we don't need to clean
-            // anything up.
             if let Some(resolution_idx) = fail_idx {
-                if let Err(e) =
-                    remove_htlcs(nodes, resolution_idx, source, route, payment_hash, false).await
+                if remove_htlcs(nodes, resolution_idx, source, route, payment_hash, false)
+                    .await
+                    .is_err()
                 {
-                    // TODO: critical error, our state machine isn't working.
-                    log::error!("Could not remove htlcs: {e}.");
+                    shutdown.trigger();
                 }
             }
 
