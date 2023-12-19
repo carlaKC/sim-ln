@@ -55,7 +55,7 @@ pub enum ForwardingError {
     // cltv delta / minimum delta
     InsufficientCltvDelta(u32, u32),
     // fee / base / prop / expected
-    InsufficientFee(u64, u64, u64, f64),
+    InsufficientFee(u64, u64, u64, u64),
 }
 
 impl Display for ForwardingError {
@@ -638,9 +638,10 @@ impl ChannelParticipant {
             ));
         }
 
+		// As u64 will round expected fee down to nearest msat.
         let expected_fee =
-            self.base_fee as f64 + ((self.fee_rate_prop as f64 * amt as f64) / 1000000.0);
-        if (fee as f64) < expected_fee {
+            (self.base_fee as f64 + ((self.fee_rate_prop as f64 * amt as f64) / 1000000.0)) as u64;
+        if fee < expected_fee {
             return Err(ForwardingError::InsufficientFee(
                 fee,
                 self.base_fee,
