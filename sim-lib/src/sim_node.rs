@@ -233,6 +233,12 @@ struct WrappedLog {}
 
 impl Logger for WrappedLog {
     fn log(&self, record: &Record) {
+        // LDK logs routes on info level, which is quite noisy for large graphs - downgrade to debug.
+        if record.args.as_str().unwrap_or("").contains("Got route") {
+            log::debug!("{}", record.args);
+            return;
+        }
+
         match record.level {
             Level::Gossip => log::trace!("{}", record.args),
             Level::Trace => log::trace!("{}", record.args),
