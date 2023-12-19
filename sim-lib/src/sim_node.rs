@@ -9,8 +9,10 @@ use bitcoin_ldk::{BlockHash, TxOut};
 use core::fmt;
 use lightning::ln::chan_utils::make_funding_redeemscript;
 use lightning::ln::features::{ChannelFeatures, NodeFeatures};
-use lightning::ln::msgs::UnsignedChannelUpdate;
-use lightning::ln::{msgs::UnsignedChannelAnnouncement, PaymentHash, PaymentPreimage};
+use lightning::ln::{
+    msgs::{LightningError as LdkError, UnsignedChannelAnnouncement, UnsignedChannelUpdate},
+    PaymentHash, PaymentPreimage,
+};
 use lightning::routing::gossip::{NetworkGraph, NodeId};
 use lightning::routing::router::{find_route, Path, Payee, PaymentParameters, RouteParameters};
 use lightning::routing::scoring::{
@@ -28,11 +30,6 @@ use tokio::sync::oneshot::{channel, Receiver, Sender};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use triggered::Listener;
-
-#[derive(Debug)]
-pub enum SimNodeError {
-    SetupError(String),
-}
 
 #[derive(Debug)]
 pub enum ForwardingError {
@@ -95,7 +92,7 @@ pub struct Graph<'a> {
 }
 
 impl Graph<'_> {
-    pub fn new(graph_channels: Vec<SimChannel>) -> Result<Self, SimNodeError> {
+    pub fn new(graph_channels: Vec<SimChannel>) -> Result<Self, LdkError> {
         let mut nodes: HashMap<PublicKey, Vec<u64>> = HashMap::new();
         let mut channels = HashMap::new();
 
@@ -142,7 +139,7 @@ pub async fn ln_node_from_graph(
 
 fn create_routing_graph(
     channels: Vec<SimChannel>,
-) -> Result<NetworkGraph<&'static WrappedLog>, SimNodeError> {
+) -> Result<NetworkGraph<&'static WrappedLog>, LdkError> {
     let graph = NetworkGraph::new(bitcoin_ldk::Network::Regtest, &WrappedLog {});
 
     // Add all the channels provided to our graph. This will also add the nodes to our network graph because ldk adds
@@ -174,14 +171,7 @@ fn create_routing_graph(
             script: make_funding_redeemscript(&node_1_pk, &node_2_pk).to_v0_p2wsh(),
         };
 
-        if let Err(e) =
-            graph.update_channel_from_unsigned_announcement(&announcement, &Some(&utxo_validator))
-        {
-            return Err(SimNodeError::SetupError(format!(
-                "could not add channel announcement: {:?}",
-                e
-            )));
-        }
+        graph.update_channel_from_unsigned_announcement(&announcement, &Some(&utxo_validator))?;
 
         macro_rules! generate_and_update_channel {
             ($node:expr, $flags:expr) => {{
@@ -198,12 +188,7 @@ fn create_routing_graph(
                     excess_data: Vec::new(),
                 };
 
-                if let Err(e) = graph.update_channel_unsigned(&update) {
-                    return Err(SimNodeError::SetupError(format!(
-                        "could not add channel update: {:?}",
-                        e
-                    )));
-                }
+                graph.update_channel_unsigned(&update)?;
             }};
         }
 
@@ -638,7 +623,7 @@ impl ChannelParticipant {
             ));
         }
 
-		// As u64 will round expected fee down to nearest msat.
+        // As u64 will round expected fee down to nearest msat.
         let expected_fee =
             (self.base_fee as f64 + ((self.fee_rate_prop as f64 * amt as f64) / 1000000.0)) as u64;
         if fee < expected_fee {
