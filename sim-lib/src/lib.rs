@@ -91,6 +91,12 @@ impl std::fmt::Display for NodeId {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
 pub struct ShortChannelID(u64);
 
+impl ShortChannelID {
+    pub fn new(scid: u64) -> Self {
+        ShortChannelID(scid)
+    }
+}
+
 /// See https://github.com/lightning/bolts/blob/60de4a09727c20dea330f9ee8313034de6e50594/07-routing-gossip.md#definition-of-short_channel_id.
 impl std::fmt::Display for ShortChannelID {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
