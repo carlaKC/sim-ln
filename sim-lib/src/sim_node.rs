@@ -58,6 +58,42 @@ pub enum ForwardingError {
     SanityCheckFailed(u64, u64, u64),
 }
 
+impl ForwardingError {
+    /// Returns a boolean indicating whether failure to forward a htlc is a critical error that warrants shutdown.
+    fn is_critical(&self) -> bool {
+        matches!(
+            self,
+            ForwardingError::ZeroAmountHtlc
+                | ForwardingError::ChannelNotFound(_)
+                | ForwardingError::NodeNotFound(_)
+                | ForwardingError::PaymentHashExists(_)
+                | ForwardingError::PaymentHashNotFound(_)
+                | ForwardingError::SanityCheckFailed(_, _, _)
+        )
+    }
+}
+
+impl Display for ForwardingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ForwardingError::ZeroAmountHtlc => write!(f, "zero amount htlc"),
+            ForwardingError::ChannelNotFound(chan_id) => write!(f, "channel {chan_id} not found"),
+			ForwardingError::NodeNotFound(node) => write!(f, "node: {node} not found"),
+            ForwardingError::PaymentHashExists(hash) => write!(f, "payment hash {} already forwarded", hex::encode(hash.0)),
+            ForwardingError::PaymentHashNotFound(hash) => write!(f, "payment hash {} not found", hex::encode(hash.0)),
+			ForwardingError::InsufficientBalance(htlc_amt, local_bal) => write!(f, "local balance: {local_bal} insufficient for htlc: {htlc_amt}"),
+			ForwardingError::LessThanMinimum(htlc_amt,min_amt ) => write!(f, "channel minimum: {min_amt} > htlc: {htlc_amt}"),
+			ForwardingError::MoreThanMaximum(htlc_amt,max_amt )=> write!(f,"channel maximum: {max_amt} < htlc: {htlc_amt}"),
+			ForwardingError::ExceedsInFlightCount(in_flight, max_in_flight ) => write!(f, "maximum in flight count: {max_in_flight} reached with {in_flight} htlcs"),
+			ForwardingError::ExceedsInFlightTotal(htlc_amt, in_flight_amt, max_in_flight) => write!(f, "maximum in flight amount: {max_in_flight} with {in_flight_amt} in flight exceeded by htlc: {htlc_amt}"),
+			ForwardingError::ExpiryInSeconds(cltv_delta) => write!(f, "cltv: {cltv_delta} expressed in seconds"),
+			ForwardingError::InsufficientCltvDelta(cltv_delta, min_delta ) => write!(f, "minimum cltv delta: {min_delta} not met by: {cltv_delta}"),
+			ForwardingError::InsufficientFee(htlc_fee, base_fee, prop_fee, expected_fee) => write!(f,"expected fee: {expected_fee} (base: {base_fee}, prop: {prop_fee}), got: {htlc_fee}"),
+			ForwardingError::SanityCheckFailed(capacity,node_1_balance ,node_2_balance ) => write!(f, "sanity check failed for capacity: {capacity}, node_1: {node_1_balance}, node_2: {node_2_balance}"),
+        }
+    }
+}
+
 #[derive(Copy, Clone)]
 struct Htlc {
     hash: PaymentHash,
