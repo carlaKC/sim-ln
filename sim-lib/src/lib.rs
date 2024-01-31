@@ -25,6 +25,7 @@ pub mod cln;
 pub mod lnd;
 mod random_activity;
 mod serializers;
+pub mod sim_node;
 #[cfg(test)]
 mod test_utils;
 
