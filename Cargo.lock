@@ -1734,6 +1734,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bitcoin 0.29.2",
  "bitcoin 0.30.1",
  "cln-grpc",
  "csv",
