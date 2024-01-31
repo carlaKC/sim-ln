@@ -1,6 +1,10 @@
 use bitcoin::secp256k1::PublicKey;
+use sim_lib::sim_node::{
+    ln_node_from_graph, populate_network_graph, ChannelPolicy, SimGraph, SimulatedChannel,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -10,7 +14,7 @@ use clap::Parser;
 use log::LevelFilter;
 use sim_lib::{
     cln::ClnNode, lnd::LndNode, ActivityDefinition, LightningError, LightningNode, NodeConnection,
-    NodeId, SimParams, Simulation, WriteResults,
+    NodeId, SimParams, Simulation,WriteResults,
 };
 use simple_logger::SimpleLogger;
 
@@ -189,7 +193,6 @@ async fn main() -> anyhow::Result<()> {
             amount_msat: act.amount_msat,
         });
     }
-
     let write_results = if !cli.no_results {
         Some(WriteResults {
             results_dir: mkdir(cli.data_dir.join("results")).await?,
@@ -199,8 +202,76 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    let capacity = 300000000;
+    let pubkey_1 =
+        PublicKey::from_str("039ae6b91fbec1b400adffcd7f7132e81efbb5aaeeeb061903695a919652aee761")?;
+    let alice_to_bob = ChannelPolicy {
+        pubkey: pubkey_1,
+        max_htlc_count: 483,
+        max_in_flight_msat: capacity / 2,
+        min_htlc_size_msat: 1,
+        max_htlc_size_msat: capacity / 2,
+        cltv_expiry_delta: 40,
+        base_fee: 1000,
+        fee_rate_prop: 3500,
+    };
+
+    let pubkey_2 =
+        PublicKey::from_str("0275ade20b15f2a309d8db2d7ea4f5004129204b83d2307433292f183bdbe5df2e")?;
+    let bob_to_alice = ChannelPolicy {
+        pubkey: pubkey_2,
+        max_htlc_count: 483,
+        max_in_flight_msat: capacity / 2,
+        min_htlc_size_msat: 1,
+        max_htlc_size_msat: capacity / 2,
+        cltv_expiry_delta: 40,
+        base_fee: 2000,
+        fee_rate_prop: 1,
+    };
+
+    let bob_to_carol = ChannelPolicy {
+        pubkey: pubkey_2,
+        max_htlc_count: 483,
+        max_in_flight_msat: capacity / 2,
+        min_htlc_size_msat: 1,
+        max_htlc_size_msat: capacity / 2,
+        cltv_expiry_delta: 40,
+        base_fee: 1000,
+        fee_rate_prop: 1000,
+    };
+
+    let pubkey_3 =
+        PublicKey::from_str("028a4929f8c7fe3ce735f86d35e716efe406956dfe6ff1e1f88ea11207976a720b")?;
+    let carol_to_bob = ChannelPolicy {
+        pubkey: pubkey_3,
+        max_htlc_count: 483,
+        max_in_flight_msat: capacity / 2,
+        min_htlc_size_msat: 1,
+        max_htlc_size_msat: capacity / 2,
+        cltv_expiry_delta: 15,
+        base_fee: 2000,
+        fee_rate_prop: 1,
+    };
+
+    let chan_alice_bob = SimulatedChannel::new(capacity, 123, alice_to_bob, bob_to_alice);
+
+    let chan_bob_carol = SimulatedChannel::new(capacity, 456, bob_to_carol, carol_to_bob);
+
+    // TODO: use the shutdown trigger and listener across simulator and graph.
+    let (shutdown_trigger, shutdown_listener) = triggered::trigger();
+    let channels = vec![chan_alice_bob, chan_bob_carol];
+    let graph = match SimGraph::new(channels.clone(), shutdown_trigger, shutdown_listener) {
+        Ok(graph) => Arc::new(Mutex::new(graph)),
+        Err(e) => anyhow::bail!("failed: {:?}", e),
+    };
+
+    let routing_graph = match populate_network_graph(channels) {
+        Ok(r) => r,
+        Err(e) => anyhow::bail!("failed: {:?}", e),
+    };
+
     let sim = Simulation::new(
-        clients,
+        ln_node_from_graph(graph, Arc::new(routing_graph)).await,
         validated_activities,
         cli.total_time,
         cli.expected_pmt_amt,
