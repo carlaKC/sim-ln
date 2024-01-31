@@ -1,11 +1,16 @@
+use std::fmt::Display;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    fmt,
+};
+
 use async_trait::async_trait;
 use bitcoin::hashes::{sha256::Hash as Sha256, Hash};
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::Network;
 use lightning::ln::chan_utils::make_funding_redeemscript;
-use std::collections::hash_map::Entry;
-use std::fmt::Display;
-use std::{collections::HashMap, fmt};
 // LDK uses a different version of bitcoin library than us, so we alias the types it use to allow use of both versions.
 use bitcoin_ldk::{
     blockdata::{constants::genesis_block, script::Script},
@@ -26,8 +31,6 @@ use lightning::routing::scoring::{
 
 use lightning::routing::utxo::{UtxoLookup, UtxoResult};
 use lightning::util::logger::{Level, Logger, Record};
-use std::str::FromStr;
-use std::sync::Arc;
 use tokio::select;
 use tokio::sync::oneshot::{channel, Receiver, Sender};
 use tokio::sync::Mutex;
@@ -633,6 +636,94 @@ impl SimGraph {
             }
         }
     }
+}
+
+/// Produces a map of node public key to lightning node implementation to be used for simulations.
+pub async fn ln_node_from_graph<'a>(
+    graph: Arc<Mutex<SimGraph>>,
+    routing_graph: Arc<NetworkGraph<&'_ WrappedLog>>,
+) -> HashMap<PublicKey, Arc<Mutex<dyn LightningNode + Send + '_>>> {
+    let mut nodes: HashMap<PublicKey, Arc<Mutex<dyn LightningNode + Send>>> = HashMap::new();
+
+    for pk in graph.lock().await.nodes.keys() {
+        nodes.insert(
+            *pk,
+            Arc::new(Mutex::new(SimNode::new(
+                *pk,
+                graph.clone(),
+                routing_graph.clone(),
+            ))),
+        );
+    }
+
+    nodes
+}
+
+/// Populates a network graph based on the set of simulated channels provided. This function *only* applies channel
+/// announcements, which has the effect of adding the nodes in each channel to the graph, because LDK does not export
+/// all of the fields required to apply node announcements. This means that we will not have node-level information
+/// (such as features) available in the routing graph.
+pub fn populate_network_graph(
+    channels: Vec<SimulatedChannel>,
+) -> Result<NetworkGraph<&'static WrappedLog>, LdkError> {
+    let graph = NetworkGraph::new(bitcoin_ldk::Network::Regtest, &WrappedLog {});
+
+    let chain_hash = genesis_block(bitcoin_ldk::Network::Regtest)
+        .header
+        .block_hash();
+
+    for channel in channels {
+        let node_1_pk = ldk_pubkey(channel.node_1.policy.pubkey);
+        let node_2_pk = ldk_pubkey(channel.node_2.policy.pubkey);
+
+        let announcement = UnsignedChannelAnnouncement {
+            // For our purposes we don't currently need any channel level features.
+            features: ChannelFeatures::empty(),
+            chain_hash,
+            short_channel_id: channel.short_channel_id,
+            node_id_1: NodeId::from_pubkey(&node_1_pk),
+            node_id_2: NodeId::from_pubkey(&node_2_pk),
+            // Note: we don't need bitcoin keys for our purposes, so we just copy them *but* remember that we do use
+            // this for our fake utxo validation so they do matter for producing the script that we mock validate.
+            bitcoin_key_1: NodeId::from_pubkey(&node_1_pk),
+            bitcoin_key_2: NodeId::from_pubkey(&node_2_pk),
+            // Internal field used by LDK, we don't need it.
+            excess_data: Vec::new(),
+        };
+
+        let utxo_validator = UtxoValidator {
+            amount_sat: channel.capacity_msat / 1000,
+            script: make_funding_redeemscript(&node_1_pk, &node_2_pk).to_v0_p2wsh(),
+        };
+
+        graph.update_channel_from_unsigned_announcement(&announcement, &Some(&utxo_validator))?;
+
+        macro_rules! generate_and_update_channel {
+            ($node:expr, $flags:expr) => {{
+                let update = UnsignedChannelUpdate {
+                    chain_hash,
+                    short_channel_id: channel.short_channel_id,
+                    timestamp: 1702667117, // TODO: current time
+                    flags: $flags,         // TODO: double check
+                    cltv_expiry_delta: $node.policy.cltv_expiry_delta as u16,
+                    htlc_minimum_msat: $node.policy.min_htlc_size_msat,
+                    htlc_maximum_msat: $node.policy.max_htlc_size_msat,
+                    fee_base_msat: $node.policy.base_fee as u32,
+                    fee_proportional_millionths: $node.policy.fee_rate_prop as u32,
+                    excess_data: Vec::new(),
+                };
+
+                graph.update_channel_unsigned(&update)?;
+            }};
+        }
+
+        // The least significant bit of the channel flag field represents the direction that the channel update
+        // applies to. This value is interpreted as node_1 if it is zero, and node_2 otherwise.
+        generate_and_update_channel!(channel.node_1, 0);
+        generate_and_update_channel!(channel.node_2, 1);
+    }
+
+    Ok(graph)
 }
 
 #[async_trait]
