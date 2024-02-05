@@ -106,6 +106,7 @@ impl ForwardingError {
 struct Htlc {
     amount_msat: u64,
     cltv_expiry: u32,
+    add_ts: SystemTime,
 }
 
 /// Represents one node in the channel's forwarding policy and restrictions. Note that this doesn't directly map to
@@ -667,7 +668,7 @@ impl<C: Clock> SimGraph<C> {
 }
 
 /// Produces a map of node public key to lightning node implementation to be used for simulations.
-pub async fn ln_node_from_graph<'a, C: Clock + 'a>(
+pub async fn ln_node_from_graph<'a, C: Clock + 'static>(
     graph: Arc<Mutex<SimGraph<C>>>,
     routing_graph: Arc<NetworkGraph<&'a WrappedLog>>,
 ) -> HashMap<PublicKey, Arc<Mutex<dyn LightningNode + '_>>> {
@@ -751,7 +752,7 @@ pub fn populate_network_graph<'a>(
 }
 
 #[async_trait]
-impl<C: Clock> SimNetwork for SimGraph<C> {
+impl<C: Clock + 'static> SimNetwork for SimGraph<C> {
     /// dispatch_payment asynchronously propagates a payment through the simulated network, returning a tracking
     /// channel that can be used to obtain the result of the payment. At present, MPP payments are not supported.
     /// In future, we'll allow multiple paths for a single payment, so we allow the trait to accept a route with
@@ -786,6 +787,7 @@ impl<C: Clock> SimNetwork for SimGraph<C> {
             path.clone(),
             payment_hash,
             sender,
+            self.clock.clone(),
             self.shutdown_trigger.clone(),
         ));
     }
@@ -818,11 +820,12 @@ impl<C: Clock> SimNetwork for SimGraph<C> {
 /// Note that we don't have any special handling for the receiving node, once we've successfully added a outgoing HTLC
 /// for the outgoing channel that is connected to the receiving node we'll return. To add invoice-related handling,
 /// we'd need to include some logic that then decides whether to settle/fail the HTLC at the last hop here.
-async fn add_htlcs(
+async fn add_htlcs<C: Clock>(
     nodes: Arc<Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
     source: PublicKey,
     route: Path,
     payment_hash: PaymentHash,
+    clock: C,
 ) -> Result<(), (Option<usize>, ForwardingError)> {
     let mut outgoing_node = source;
     let mut outgoing_amount = route.fee_msat() + route.final_value_msat();
@@ -850,6 +853,7 @@ async fn add_htlcs(
                     Htlc {
                         amount_msat: outgoing_amount,
                         cltv_expiry: outgoing_cltv,
+                        add_ts: clock.now(),
                     },
                 )
                 // If we couldn't add to this HTLC, we only need to fail back from the preceding hop, so we don't
@@ -946,19 +950,19 @@ async fn remove_htlcs(
 /// Finds a payment path from the source to destination nodes provided, and propagates the appropriate htlcs through
 /// the simulated network, notifying the sender channel provided of the payment outcome. If a critical error occurs,
 /// ie a breakdown of our state machine, it will still notify the payment outcome and will use the shutdown trigger
-/// to signal that we should exit.
-async fn propagate_payment(
+async fn propagate_payment<C: Clock>(
     nodes: Arc<Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
     source: PublicKey,
     route: Path,
     payment_hash: PaymentHash,
     sender: Sender<Result<PaymentResult, LightningError>>,
+    clock: C,
     shutdown: Trigger,
 ) {
     // If we partially added HTLCs along the route, we need to fail them back to the source to clean up our partial
     // state. It's possible that we failed with the very first add, and then we don't need to clean anything up.
     let notify_result = if let Err((fail_idx, err)) =
-        add_htlcs(nodes.clone(), source, route.clone(), payment_hash).await
+        add_htlcs(nodes.clone(), source, route.clone(), payment_hash, clock).await
     {
         if err.is_critical() {
             shutdown.trigger();
@@ -1096,6 +1100,7 @@ mod tests {
         // this test.
         let hash_1 = PaymentHash { 0: [1; 32] };
         let htlc_1 = Htlc {
+            add_ts: SystemTime::UNIX_EPOCH,
             amount_msat: 1000,
             cltv_expiry: 40,
         };
@@ -1119,6 +1124,7 @@ mod tests {
         // Add a second, distinct htlc to our in-flight state.
         let hash_2 = PaymentHash { 0: [2; 32] };
         let htlc_2 = Htlc {
+            add_ts: SystemTime::UNIX_EPOCH,
             amount_msat: 1000,
             cltv_expiry: 40,
         };
@@ -1205,6 +1211,7 @@ mod tests {
         let mut channel_state = create_test_channel(local_balance, local_balance / 2);
 
         let mut htlc = Htlc {
+            add_ts: SystemTime::UNIX_EPOCH,
             amount_msat: channel_state.policy.max_htlc_size_msat + 1,
             cltv_expiry: channel_state.policy.cltv_expiry_delta,
         };
@@ -1224,6 +1231,7 @@ mod tests {
         // Add two large htlcs so that we will start to run into our in-flight total amount limit.
         let hash_1 = PaymentHash { 0: [1; 32] };
         let htlc_1 = Htlc {
+            add_ts: SystemTime::UNIX_EPOCH,
             amount_msat: channel_state.policy.max_in_flight_msat / 2,
             cltv_expiry: channel_state.policy.cltv_expiry_delta,
         };
@@ -1233,6 +1241,7 @@ mod tests {
 
         let hash_2 = PaymentHash { 0: [2; 32] };
         let htlc_2 = Htlc {
+            add_ts: SystemTime::UNIX_EPOCH,
             amount_msat: channel_state.policy.max_in_flight_msat / 2,
             cltv_expiry: channel_state.policy.cltv_expiry_delta,
         };
@@ -1262,6 +1271,7 @@ mod tests {
 
         // Try to add one more htlc and we should be rejected.
         let htlc_3 = Htlc {
+            add_ts: SystemTime::UNIX_EPOCH,
             amount_msat: channel_state.policy.min_htlc_size_msat,
             cltv_expiry: channel_state.policy.cltv_expiry_delta,
         };
@@ -1282,6 +1292,7 @@ mod tests {
         // Add and settle another htlc to move more liquidity away from our local balance.
         let hash_4 = PaymentHash { 0: [1; 32] };
         let htlc_4 = Htlc {
+            add_ts: SystemTime::UNIX_EPOCH,
             amount_msat: channel_state.policy.max_htlc_size_msat,
             cltv_expiry: channel_state.policy.cltv_expiry_delta,
         };
@@ -1319,6 +1330,7 @@ mod tests {
         // Assert that we're not able to send a htlc over node_2 -> node_1 (no liquidity).
         let hash_1 = PaymentHash { 0: [1; 32] };
         let htlc_1 = Htlc {
+            add_ts: SystemTime::UNIX_EPOCH,
             amount_msat: node_2.policy.min_htlc_size_msat,
             cltv_expiry: node_1.policy.cltv_expiry_delta,
         };
@@ -1331,6 +1343,7 @@ mod tests {
         // Assert that we can send a htlc over node_1 -> node_2.
         let hash_2 = PaymentHash { 0: [1; 32] };
         let htlc_2 = Htlc {
+            add_ts: SystemTime::UNIX_EPOCH,
             amount_msat: node_1.policy.max_htlc_size_msat,
             cltv_expiry: node_2.policy.cltv_expiry_delta,
         };
