@@ -1,5 +1,6 @@
 use crate::{
-    LightningError, LightningNode, NodeInfo, PaymentOutcome, PaymentResult, SimulationError,
+    clock::Clock, LightningError, LightningNode, NodeInfo, PaymentOutcome, PaymentResult,
+    SimulationError,
 };
 use async_trait::async_trait;
 use bitcoin::constants::ChainHash;
@@ -601,7 +602,7 @@ impl<T: SimNetwork> LightningNode for SimNode<'_, T> {
 }
 
 /// Graph is the top level struct that is used to coordinate simulation of lightning nodes.
-pub struct SimGraph {
+pub struct SimGraph<C: Clock> {
     /// nodes caches the list of nodes in the network with a vector of their channel capacities, only used for quick
     /// lookup.
     nodes: HashMap<PublicKey, Vec<u64>>,
@@ -612,14 +613,17 @@ pub struct SimGraph {
     /// track all tasks spawned to process payments in the graph.
     tasks: JoinSet<()>,
 
+    clock: C,
+
     /// trigger shutdown if a critical error occurs.
     shutdown_trigger: Trigger,
 }
 
-impl SimGraph {
+impl<C: Clock> SimGraph<C> {
     /// Creates a graph on which to simulate payments.
     pub fn new(
         graph_channels: Vec<SimulatedChannel>,
+        clock: C,
         shutdown_trigger: Trigger,
     ) -> Result<Self, LdkError> {
         let mut nodes: HashMap<PublicKey, Vec<u64>> = HashMap::new();
@@ -641,6 +645,7 @@ impl SimGraph {
         Ok(SimGraph {
             nodes,
             channels: Arc::new(Mutex::new(channels)),
+            clock,
             tasks: JoinSet::new(),
             shutdown_trigger,
         })
@@ -662,9 +667,9 @@ impl SimGraph {
 }
 
 /// Produces a map of node public key to lightning node implementation to be used for simulations.
-pub async fn ln_node_from_graph<'a>(
-    graph: Arc<Mutex<SimGraph>>,
-    routing_graph: Arc<NetworkGraph<&'_ WrappedLog>>,
+pub async fn ln_node_from_graph<'a, C: Clock + 'a>(
+    graph: Arc<Mutex<SimGraph<C>>>,
+    routing_graph: Arc<NetworkGraph<&'a WrappedLog>>,
 ) -> HashMap<PublicKey, Arc<Mutex<dyn LightningNode + '_>>> {
     let mut nodes: HashMap<PublicKey, Arc<Mutex<dyn LightningNode>>> = HashMap::new();
 
@@ -746,7 +751,7 @@ pub fn populate_network_graph<'a>(
 }
 
 #[async_trait]
-impl SimNetwork for SimGraph {
+impl<C: Clock> SimNetwork for SimGraph<C> {
     /// dispatch_payment asynchronously propagates a payment through the simulated network, returning a tracking
     /// channel that can be used to obtain the result of the payment. At present, MPP payments are not supported.
     /// In future, we'll allow multiple paths for a single payment, so we allow the trait to accept a route with
@@ -1041,6 +1046,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::clock::SystemClock;
     use crate::test_utils::get_random_keypair;
     use bitcoin::secp256k1::PublicKey;
     use lightning::routing::router::Route;
@@ -1533,7 +1539,7 @@ mod tests {
 
     /// Contains elements required to test dispatch_payment functionality.
     struct DispatchPaymentTestKit<'a> {
-        graph: SimGraph,
+        graph: SimGraph<SystemClock>,
         nodes: Vec<PublicKey>,
         routing_graph: NetworkGraph<&'a WrappedLog>,
         shutdown: triggered::Trigger,
@@ -1561,7 +1567,7 @@ mod tests {
             ];
 
             DispatchPaymentTestKit {
-                graph: SimGraph::new(channels.clone(), shutdown.clone())
+                graph: SimGraph::new(channels.clone(), SystemClock {}, shutdown.clone())
                     .expect("could not create test graph"),
                 nodes,
                 routing_graph: populate_network_graph(channels).unwrap(),
