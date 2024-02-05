@@ -108,6 +108,7 @@ struct Htlc {
     amount_msat: u64,
     cltv_expiry: u32,
     add_ts: SystemTime,
+    remove_ts: Option<SystemTime>,
 }
 
 /// Represents one node in the channel's forwarding policy and restrictions. Note that this doesn't directly map to
@@ -387,12 +388,17 @@ impl SimulatedChannel {
         sending_node: &PublicKey,
         hash: &PaymentHash,
         success: bool,
-    ) -> Result<(), ForwardingError> {
-        let htlc = self
+        remove_time: SystemTime,
+    ) -> Result<Htlc, ForwardingError> {
+        let mut htlc = self
             .get_node_mut(sending_node)?
             .remove_outgoing_htlc(hash)?;
+        htlc.remove_ts = Some(remove_time);
+
         self.settle_htlc(sending_node, htlc.amount_msat, success)?;
-        self.sanity_check()
+        self.sanity_check()?;
+
+        Ok(htlc)
     }
 
     /// Updates the local balance of each node in the channel once a htlc has been resolved, pushing funds to the
@@ -935,6 +941,7 @@ async fn add_htlcs(
                         amount_msat: outgoing_amount,
                         cltv_expiry: outgoing_cltv,
                         add_ts: clock.now(),
+                        remove_ts: None,
                     },
                 )
                 // If we couldn't add to this HTLC, we only need to fail back from the preceding hop, so we don't
@@ -998,7 +1005,10 @@ async fn remove_htlcs(
     route: Path,
     payment_hash: PaymentHash,
     success: bool,
-) -> Result<(), ForwardingError> {
+    clock: Arc<dyn Clock>,
+) -> Result<Vec<Htlc>, ForwardingError> {
+    let mut route_htlcs: Vec<Htlc> = vec![];
+
     for (i, hop) in route.hops[0..=resolution_idx].iter().enumerate().rev() {
         // When we add HTLCs, we do so on the state of the node that sent the htlc along the channel so we need to
         // look up our incoming node so that we can remove it when we go backwards. For the first htlc, this is just
@@ -1016,7 +1026,14 @@ async fn remove_htlcs(
             .await
             .get_mut(&ShortChannelID::from(hop.short_channel_id))
         {
-            Some(channel) => channel.remove_htlc(&incoming_node, &payment_hash, success)?,
+            Some(channel) => {
+                route_htlcs.push(channel.remove_htlc(
+                    &incoming_node,
+                    &payment_hash,
+                    success,
+                    clock.now(),
+                )?);
+            },
             None => {
                 return Err(ForwardingError::ChannelNotFound(ShortChannelID::from(
                     hop.short_channel_id,
@@ -1025,7 +1042,7 @@ async fn remove_htlcs(
         }
     }
 
-    Ok(())
+    Ok(route_htlcs.into_iter().rev().collect())
 }
 
 /// Finds a payment path from the source to destination nodes provided, and propagates the appropriate htlcs through
@@ -1042,16 +1059,30 @@ async fn propagate_payment(
 ) {
     // If we partially added HTLCs along the route, we need to fail them back to the source to clean up our partial
     // state. It's possible that we failed with the very first add, and then we don't need to clean anything up.
-    let notify_result = if let Err((fail_idx, err)) =
-        add_htlcs(nodes.clone(), source, route.clone(), payment_hash, clock).await
+    let notify_result = if let Err((fail_idx, err)) = add_htlcs(
+        nodes.clone(),
+        source,
+        route.clone(),
+        payment_hash,
+        clock.clone(),
+    )
+    .await
     {
         if err.is_critical() {
             shutdown.trigger();
         }
 
         if let Some(resolution_idx) = fail_idx {
-            if let Err(e) =
-                remove_htlcs(nodes, resolution_idx, source, route, payment_hash, false).await
+            if let Err(e) = remove_htlcs(
+                nodes,
+                resolution_idx,
+                source,
+                route,
+                payment_hash,
+                false,
+                clock.clone(),
+            )
+            .await
             {
                 if e.is_critical() {
                     shutdown.trigger();
@@ -1079,6 +1110,7 @@ async fn propagate_payment(
             route,
             payment_hash,
             true,
+            clock.clone(),
         )
         .await
         {
@@ -1240,6 +1272,7 @@ mod tests {
         let hash_1 = PaymentHash([1; 32]);
         let htlc_1 = Htlc {
             add_ts: SystemTime::UNIX_EPOCH,
+            remove_ts: None,
             amount_msat: 1000,
             cltv_expiry: 40,
         };
@@ -1263,6 +1296,7 @@ mod tests {
         let hash_2 = PaymentHash([2; 32]);
         let htlc_2 = Htlc {
             add_ts: SystemTime::UNIX_EPOCH,
+            remove_ts: None,
             amount_msat: 1000,
             cltv_expiry: 40,
         };
@@ -1351,6 +1385,7 @@ mod tests {
 
         let mut htlc = Htlc {
             add_ts: SystemTime::UNIX_EPOCH,
+            remove_ts: None,
             amount_msat: channel_state.policy.max_htlc_size_msat + 1,
             cltv_expiry: channel_state.policy.cltv_expiry_delta,
         };
@@ -1371,6 +1406,7 @@ mod tests {
         let hash_1 = PaymentHash([1; 32]);
         let htlc_1 = Htlc {
             add_ts: SystemTime::UNIX_EPOCH,
+            remove_ts: None,
             amount_msat: channel_state.policy.max_in_flight_msat / 2,
             cltv_expiry: channel_state.policy.cltv_expiry_delta,
         };
@@ -1381,6 +1417,7 @@ mod tests {
         let hash_2 = PaymentHash([2; 32]);
         let htlc_2 = Htlc {
             add_ts: SystemTime::UNIX_EPOCH,
+            remove_ts: None,
             amount_msat: channel_state.policy.max_in_flight_msat / 2,
             cltv_expiry: channel_state.policy.cltv_expiry_delta,
         };
@@ -1412,6 +1449,7 @@ mod tests {
         // Try to add one more htlc and we should be rejected.
         let htlc_3 = Htlc {
             add_ts: SystemTime::UNIX_EPOCH,
+            remove_ts: None,
             amount_msat: channel_state.policy.min_htlc_size_msat,
             cltv_expiry: channel_state.policy.cltv_expiry_delta,
         };
@@ -1432,6 +1470,7 @@ mod tests {
         let hash_4 = PaymentHash([1; 32]);
         let htlc_4 = Htlc {
             add_ts: SystemTime::UNIX_EPOCH,
+            remove_ts: None,
             amount_msat: channel_state.policy.max_htlc_size_msat,
             cltv_expiry: channel_state.policy.cltv_expiry_delta,
         };
@@ -1471,6 +1510,7 @@ mod tests {
         let hash_1 = PaymentHash([1; 32]);
         let htlc_1 = Htlc {
             add_ts: SystemTime::UNIX_EPOCH,
+            remove_ts: None,
             amount_msat: node_2.policy.min_htlc_size_msat,
             cltv_expiry: node_1.policy.cltv_expiry_delta,
         };
@@ -1484,6 +1524,7 @@ mod tests {
         let hash_2 = PaymentHash([1; 32]);
         let htlc_2 = Htlc {
             add_ts: SystemTime::UNIX_EPOCH,
+            remove_ts: None,
             amount_msat: node_1.policy.max_htlc_size_msat,
             cltv_expiry: node_2.policy.cltv_expiry_delta,
         };
@@ -1494,7 +1535,7 @@ mod tests {
         // Settle the htlc and then assert that we can send from node_2 -> node_2 because the balance has been shifted
         // across channels.
         assert!(simulated_channel
-            .remove_htlc(&node_1.policy.pubkey, &hash_2, true)
+            .remove_htlc(&node_1.policy.pubkey, &hash_1, true, SystemTime::now())
             .is_ok());
 
         assert!(simulated_channel
@@ -1510,7 +1551,7 @@ mod tests {
         ));
 
         assert!(matches!(
-            simulated_channel.remove_htlc(&pk, &hash_2, true),
+            simulated_channel.remove_htlc(&pk, &hash_2, true, SystemTime::now()),
             Err(ForwardingError::NodeNotFound(_))
         ));
     }
