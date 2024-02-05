@@ -25,6 +25,7 @@ use tokio::{select, time, time::Duration};
 use triggered::{Listener, Trigger};
 
 pub mod cln;
+pub mod clock;
 mod defined_activity;
 pub mod lnd;
 mod random_activity;
