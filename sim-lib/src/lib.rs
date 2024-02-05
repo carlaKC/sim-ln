@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::Network;
-use csv::WriterBuilder;
 use lightning::ln::features::NodeFeatures;
 use lightning::ln::PaymentHash;
 use random_activity::RandomActivityError;
@@ -19,9 +18,11 @@ use tokio::task::JoinSet;
 use tokio::{select, time, time::Duration};
 use triggered::{Listener, Trigger};
 
+use self::batched_writer::BatchedWriter;
 use self::defined_activity::DefinedPaymentActivity;
 use self::random_activity::{NetworkGraphView, RandomPaymentActivity};
 
+mod batched_writer;
 pub mod cln;
 pub mod clock;
 mod defined_activity;
@@ -890,25 +891,26 @@ async fn write_payment_results(
     listener: Listener,
     write_results: Option<WriteResults>,
 ) -> Result<(), SimulationError> {
-    let mut writer = write_results.and_then(|write_result| {
-        let file = write_result.results_dir.join(format!(
+    let mut writer = None;
+    if let Some(w) = write_results {
+        // File name contains time that simulation was started.
+        let file_name = format!(
             "simulation_{:?}.csv",
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
                 .as_secs()
-        ));
-        let writer = WriterBuilder::new().from_path(file).ok()?;
-        Some((writer, write_result.batch_size))
-    });
+        );
 
-    let mut counter = 1;
+        writer = Some(BatchedWriter::new(w.results_dir, file_name, w.batch_size)?);
+    }
+
     loop {
         tokio::select! {
             biased;
             _ = listener.clone() => {
                 log::debug!("Simulation results consumer received shutdown signal.");
-                return writer.map_or(Ok(()), |(ref mut w, _)| w.flush().map_err(|_| SimulationError::FileError))
+                return writer.map_or(Ok(()), |mut w| w.write(true));
             },
             payment_report = receiver.recv() => {
                 match payment_report {
@@ -916,18 +918,11 @@ async fn write_payment_results(
                         logger.lock().await.report_result(&details, &result);
                         log::trace!("Resolved dispatched payment: {} with: {}.", details, result);
 
-                        if let Some((ref mut w, batch_size)) = writer {
-                            w.serialize((details, result)).map_err(|e| {
-                                let _ = w.flush();
-                                SimulationError::CsvError(e)
-                            })?;
-                            counter = counter % batch_size + 1;
-                            if batch_size == counter {
-                                w.flush().map_err(|_| SimulationError::FileError)?;
-                            }
+                        if let Some(ref mut w) = writer{
+                            w.queue((details, result))?;
                         }
                     },
-                    None => return writer.map_or(Ok(()), |(ref mut w, _)| w.flush().map_err(|_| SimulationError::FileError)),
+                    None => return writer.map_or(Ok(()), |mut w| w.write(true)),
                 }
             }
         }
