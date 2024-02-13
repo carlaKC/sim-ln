@@ -86,7 +86,7 @@ impl std::fmt::Display for NodeId {
 }
 
 /// Represents a short channel ID, expressed as a struct so that we can implement display for the trait.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ShortChannelID(u64);
 
 /// See https://github.com/lightning/bolts/blob/60de4a09727c20dea330f9ee8313034de6e50594/07-routing-gossip.md#definition-of-short_channel_id.
