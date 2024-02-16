@@ -15,6 +15,21 @@ pub mod serde_option_payment_hash {
     }
 }
 
+pub mod serde_system_time {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    pub fn serialize<S>(ts: &SystemTime, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u128(
+            ts.duration_since(UNIX_EPOCH)
+                .expect("timestamp before epoch")
+                .as_nanos(),
+        )
+    }
+}
+
 pub mod serde_node_id {
     use super::*;
     use std::str::FromStr;
