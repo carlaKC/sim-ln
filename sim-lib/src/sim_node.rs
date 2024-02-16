@@ -1,6 +1,6 @@
 use crate::{
-    clock::Clock, LightningError, LightningNode, NodeInfo, PaymentOutcome, PaymentResult,
-    SimulationError,
+    batched_writer::BatchedWriter, clock::Clock, serializers, LightningError, LightningNode,
+    NodeInfo, PaymentOutcome, PaymentResult, SimulationError, WriteResults,
 };
 use async_trait::async_trait;
 use bitcoin::constants::ChainHash;
@@ -8,10 +8,6 @@ use bitcoin::hashes::{sha256::Hash as Sha256, Hash};
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Network, ScriptBuf, TxOut};
 use lightning::ln::chan_utils::make_funding_redeemscript;
-use std::collections::{hash_map::Entry, HashMap};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use lightning::ln::features::{ChannelFeatures, NodeFeatures};
 use lightning::ln::msgs::{
     LightningError as LdkError, UnsignedChannelAnnouncement, UnsignedChannelUpdate,
@@ -22,6 +18,10 @@ use lightning::routing::router::{find_route, Path, PaymentParameters, Route, Rou
 use lightning::routing::scoring::ProbabilisticScorer;
 use lightning::routing::utxo::{UtxoLookup, UtxoResult};
 use lightning::util::logger::{Level, Logger, Record};
+use serde::Serialize;
+use std::collections::{hash_map::Entry, HashMap};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::select;
 use tokio::sync::oneshot::{channel, Receiver, Sender};
@@ -622,6 +622,9 @@ pub struct SimGraph<C: Clock> {
 
     clock: C,
 
+    /// Optional writer to flush htlc forwards to disk.
+    writer: Option<Arc<Mutex<BatchedWriter>>>,
+
     /// trigger shutdown if a critical error occurs.
     shutdown_trigger: Trigger,
 }
@@ -631,6 +634,7 @@ impl<C: Clock> SimGraph<C> {
     pub fn new(
         graph_channels: Vec<SimulatedChannel>,
         clock: C,
+        write_results: Option<WriteResults>,
         shutdown_trigger: Trigger,
     ) -> Result<Self, LdkError> {
         let mut nodes: HashMap<PublicKey, Vec<u64>> = HashMap::new();
@@ -649,10 +653,25 @@ impl<C: Clock> SimGraph<C> {
             }
         }
 
+        // Once off create the file we'll be writing to and add our own headers.
+        let writer = if let Some(w) = write_results {
+            // TODO: use simulation error not lightning error in this function
+            let writer =
+                BatchedWriter::new(w.results_dir, "htlc_forwards.csv".to_string(), w.batch_size)
+                    .map_err(|_| LdkError {
+                        err: "could not create dir".to_string(),
+                        action: lightning::ln::msgs::ErrorAction::IgnoreError,
+                    })?;
+            Some(Arc::new(Mutex::new(writer)))
+        } else {
+            None
+        };
+
         Ok(SimGraph {
             nodes,
             channels: Arc::new(Mutex::new(channels)),
             clock,
+            writer,
             tasks: JoinSet::new(),
             shutdown_trigger,
         })
@@ -666,6 +685,13 @@ impl<C: Clock> SimGraph<C> {
         while let Some(res) = self.tasks.join_next().await {
             if let Err(e) = res {
                 log::error!("Graph task exited with error: {e}");
+            }
+        }
+
+        // If we're shutting down, force-flush any pending writes to disk.
+        if let Some(w) = self.writer.clone() {
+            if let Err(e) = w.lock().await.write(true) {
+                log::error!("Failed to flush forwards to disk: {e}");
             }
         }
 
@@ -793,6 +819,7 @@ impl<C: Clock + 'static> SimNetwork for SimGraph<C> {
             path.clone(),
             payment_hash,
             sender,
+            self.writer.clone(),
             self.clock.clone(),
             self.shutdown_trigger.clone(),
         ));
@@ -973,6 +1000,7 @@ async fn propagate_payment<C: Clock>(
     route: Path,
     payment_hash: PaymentHash,
     sender: Sender<Result<PaymentResult, LightningError>>,
+    writer: Option<Arc<Mutex<BatchedWriter>>>,
     clock: C,
     shutdown: Trigger,
 ) {
@@ -1022,22 +1050,34 @@ async fn propagate_payment<C: Clock>(
         }
     } else {
         // If we successfully added the htlc, go ahead and remove all the htlcs in the route with successful resolution.
-        if let Err(e) = remove_htlcs(
+        match remove_htlcs(
             nodes,
             route.hops.len(),
             source,
-            route,
+            route.clone(),
             payment_hash,
             true,
             clock.clone(),
         )
         .await
         {
-            if e.is_critical() {
-                shutdown.trigger();
-            }
+            // If we successfully removed the htlcs, we can write the forwarding results to
+            // disk. We do not expect this operation to fail and can shutdown if it does.
+            Ok(htlcs) => {
+                if let Some(w) = writer {
+                    if let Err(e) = write_forwards(w, htlcs, route).await {
+                        log::error!("Could not write forwards: {e}");
+                        shutdown.trigger();
+                    }
+                }
+            },
+            Err(e) => {
+                if e.is_critical() {
+                    shutdown.trigger();
+                }
 
-            log::error!("Could not remove htlcs from channel: {e}.");
+                log::error!("Could not remove htlcs from channel: {e}.");
+            },
         }
 
         PaymentResult {
@@ -1049,6 +1089,72 @@ async fn propagate_payment<C: Clock>(
     if let Err(e) = sender.send(Ok(notify_result)) {
         log::error!("Could not notify payment result: {:?}.", e);
     }
+}
+
+#[derive(Debug, Serialize)]
+struct HtlcForward {
+    incoming_amt: u64,
+    incoming_expiry: u32,
+    #[serde(with = "serializers::serde_system_time")]
+    incoming_add_ts: SystemTime,
+    #[serde(with = "serializers::serde_system_time")]
+    incoming_remove_ts: SystemTime,
+    outgoing_amt: u64,
+    outgoing_expiry: u32,
+    #[serde(with = "serializers::serde_system_time")]
+    outgoing_add_ts: SystemTime,
+    #[serde(with = "serializers::serde_system_time")]
+    outgoing_remove_ts: SystemTime,
+    forwarding_node: PublicKey,
+    chan_in: u64,
+    chan_out: u64,
+}
+
+/// Takes a vector of hops and writes their corresponding forwards to disk. We provide both our list of HTLCs that have
+/// been timestamped with add/remove time and the original path which has channel and node information so that we
+/// don't need to duplicate storage of that information to write it to disk. Will be a no-op if there route was a
+/// single hop because we are only recording forwards (one hop payment has no forwards).
+async fn write_forwards(
+    writer: Arc<Mutex<BatchedWriter>>,
+    htlcs: Vec<Htlc>,
+    path: Path,
+) -> Result<(), SimulationError> {
+    if htlcs.len() <= 1 {
+        return Ok(());
+    }
+
+    if htlcs.len() != path.hops.len() {
+        return Err(SimulationError::SimulatedNetworkError(format!(
+            "Route length: {} != htlc count: {}",
+            path.hops.len(),
+            htlcs.len()
+        )));
+    }
+
+    // We want to persist the HTLC forwards that we've simulated, and we have a list of individual
+    // hops. To combine the incoming/outgoing htlc for each forward, we start at index 1 and look
+    // back to the previous htlc to get our incoming details. If this is a single-hop payment,
+    // the for loop will never run.
+    for i in 1..=htlcs.len() - 1 {
+        let incoming_htlc = htlcs[i - 1];
+        let outgoing_htlc = htlcs[i];
+
+        writer.lock().await.queue(HtlcForward {
+            incoming_amt: incoming_htlc.amount_msat,
+            incoming_expiry: incoming_htlc.cltv_expiry,
+            incoming_add_ts: incoming_htlc.add_ts,
+            incoming_remove_ts: incoming_htlc.remove_ts.unwrap(),
+            outgoing_amt: outgoing_htlc.amount_msat,
+            outgoing_expiry: outgoing_htlc.cltv_expiry,
+            outgoing_add_ts: outgoing_htlc.add_ts,
+            outgoing_remove_ts: outgoing_htlc.remove_ts.unwrap(),
+            forwarding_node: path.hops[i - 1].pubkey,
+            chan_in: path.hops[i - 1].short_channel_id,
+            chan_out: path.hops[i].short_channel_id,
+        })?;
+    }
+
+    Ok(())
 }
 
 /// WrappedLog implements LDK's logging trait so that we can provide pathfinding with a logger that uses our existing
@@ -1628,7 +1734,7 @@ mod tests {
             ];
 
             DispatchPaymentTestKit {
-                graph: SimGraph::new(channels.clone(), SystemClock {}, shutdown.clone())
+                graph: SimGraph::new(channels.clone(), SystemClock {}, None, shutdown.clone())
                     .expect("could not create test graph"),
                 nodes,
                 routing_graph: populate_network_graph(channels).unwrap(),
