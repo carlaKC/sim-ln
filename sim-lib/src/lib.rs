@@ -594,8 +594,13 @@ impl Simulation {
 
         // Setup a simulation graph that will handle propagation of payments through the network.
         let simulation_graph = Arc::new(Mutex::new(
-            SimGraph::new(channels.clone(), clock.clone(), shutdown_trigger.clone())
-                .map_err(|e| SimulationError::SimulatedNetworkError(format!("{:?}", e)))?,
+            SimGraph::new(
+                channels.clone(),
+                clock.clone(),
+                cfg.write_results.clone(),
+                shutdown_trigger.clone(),
+            )
+            .map_err(|e| SimulationError::SimulatedNetworkError(format!("{:?}", e)))?,
         ));
 
         // Copy all of our simulated channels into a read-only routing graph, allowing us to pathfind for individual
