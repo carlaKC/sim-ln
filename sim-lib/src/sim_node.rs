@@ -1038,11 +1038,15 @@ impl UtxoLookup for UtxoValidator {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::test_utils::get_random_keypair;
     use bitcoin::secp256k1::PublicKey;
     use lightning::routing::router::Route;
     use mockall::mock;
+    use tokio::sync::oneshot;
+    use tokio::time::sleep;
 
     /// Creates a test channel state with the local balance and maximum in flight value provided. The maximum htlc
     /// value for the channel is set to half of the max_in_flight_msat, and the minimum is hardcoded to 2 (so that we
@@ -1496,5 +1500,171 @@ mod tests {
             result_2.payment_outcome,
             PaymentOutcome::InsufficientBalance
         ));
+    }
+
+    /// Creates a simulated channel between two nodes with common routing values that are set in lightning today.
+    /// Nodes have similar (but not identical) routing policies because we're not particularly concerned with the
+    /// logic of our forwarding semantics here, but still want things to fail if we're using the wrong policy in a
+    /// certain direction.
+    fn create_simulated_channel(
+        source: PublicKey,
+        dest: PublicKey,
+        scid: ShortChannelID,
+        capacity: u64,
+    ) -> SimulatedChannel {
+        let source_policy = ChannelPolicy {
+            pubkey: source,
+            max_htlc_count: 483,
+            max_in_flight_msat: capacity,
+            min_htlc_size_msat: 1,
+            max_htlc_size_msat: capacity,
+            cltv_expiry_delta: 80,
+            base_fee: 1000,
+            fee_rate_prop: 100,
+        };
+
+        // Copy except for cltv delta so that we'll hit issues if we use the wrong policy during propagation.
+        let mut dest_policy = source_policy.clone();
+        dest_policy.pubkey = dest;
+        dest_policy.cltv_expiry_delta = 40;
+
+        SimulatedChannel::new(capacity, scid, source_policy, dest_policy)
+    }
+
+    /// Contains elements required to test dispatch_payment functionality.
+    struct DispatchPaymentTestKit<'a> {
+        graph: SimGraph,
+        nodes: Vec<PublicKey>,
+        routing_graph: NetworkGraph<&'a WrappedLog>,
+        shutdown: triggered::Trigger,
+    }
+
+    impl<'a> DispatchPaymentTestKit<'a> {
+        /// Creates a test graph with a set of nodes connected by channels and liquidity balance:
+        /// Alice (50k)----(50k)-Bob-(50k)----(50k)-Carol-(25k)---(25k) Dave.
+        ///
+        /// The graph, an in-order list of node pubkeys and a shutdown trigger that can be used to kill any tasks spun
+        /// up by the graph are returned.
+        fn new() -> Self {
+            let (shutdown, _listener) = triggered::trigger();
+
+            let (_, alice) = get_random_keypair();
+            let (_, bob) = get_random_keypair();
+            let (_, carol) = get_random_keypair();
+            let (_, dave) = get_random_keypair();
+
+            let nodes = vec![alice, bob, carol, dave];
+            let channels = vec![
+                create_simulated_channel(alice, bob, ShortChannelID(1), 100_000_000),
+                create_simulated_channel(bob, carol, ShortChannelID(2), 100_000_000),
+                create_simulated_channel(carol, dave, ShortChannelID(3), 50_000_000),
+            ];
+
+            DispatchPaymentTestKit {
+                graph: SimGraph::new(channels.clone(), shutdown.clone())
+                    .expect("could not create test graph"),
+                nodes,
+                routing_graph: populate_network_graph(channels).unwrap(),
+                shutdown,
+            }
+        }
+
+        async fn get_chan_state(&self, scid: ShortChannelID, node: &PublicKey) -> ChannelState {
+            self.graph
+                .channels
+                .lock()
+                .await
+                .get(&scid)
+                .unwrap()
+                .get_node(node)
+                .unwrap()
+                .clone()
+        }
+
+        async fn assert_balance_propagated(&self, amount_msat: u64, path: Path) {
+            let mut expected_receiver_delta = amount_msat;
+
+            for (i, hop) in path.hops.iter().rev().enumerate() {
+                // Assert that the hop that received the HTLC was credited the amount that we expect for the hop.
+                self.get_chan_state(ShortChannelID::new(hop.short_channel_id), &hop.pubkey)
+                    .await
+                    .local_balance_msat;
+
+                // Add the fee for the outgoing link, because we expect it to accrue on the incoming link.
+                expected_receiver_delta += hop.fee_msat; // I don't think this is the right fee
+            }
+
+            // Assert that the sending node's balance was decreased by the amount sent for the full route.
+        }
+    }
+
+    /// Tests dispatch of payments across a test network of simulated channels.
+    #[tokio::test]
+    async fn test_successful_dispatch() {
+        let mut test_kit = DispatchPaymentTestKit::new();
+
+        // Get a route from Alice -> Dave.
+        let route = find_payment_route(
+            &test_kit.nodes[0],
+            test_kit.nodes[3],
+            20_000,
+            &test_kit.routing_graph,
+        )
+        .unwrap();
+
+        let (sender, mut receiver) = oneshot::channel();
+        test_kit.graph.dispatch_payment(
+            test_kit.nodes[0],
+            route,
+            PaymentHash { 0: [1; 32] },
+            sender,
+        );
+
+        // TODO: receive from this channel or timeout! in a cleaner way
+        let mut i = 1;
+        loop {
+            if let Ok(res) = receiver.try_recv() {
+                assert!(matches!(
+                    res.unwrap().payment_outcome,
+                    PaymentOutcome::Success
+                ));
+                break;
+            } else {
+                if i == 5 {
+                    panic!("test ran for 5 seconds without payment success");
+                }
+                sleep(Duration::from_secs(1)).await;
+                i += 1;
+            }
+        }
+
+        // Assert that recipient has been credited the amount we expected.
+        let receiver_balance = test_kit
+            .graph
+            .channels
+            .lock()
+            .await
+            .get(&ShortChannelID(3)) // Note: hardcoding scid of Carol -- Dave.
+            .unwrap()
+			.get_node(&test_kit.nodes[3]) // Dave
+            .unwrap().local_balance_msat;
+
+        assert_eq!(receiver_balance, 25_000_000 + 20_000);
+
+        let penultimate_balance = test_kit
+            .graph
+            .channels
+            .lock()
+            .await
+            .get(&ShortChannelID(3)) // Note: hardcoding scid of Carol -- Dave.
+            .unwrap()
+            .get_node(&test_kit.nodes[2]) // Carol
+            .unwrap().local_balance_msat;
+
+        assert_eq!(penultimate_balance, 25_000_000 - 20_000);
+        // Trigger shutdown and wait for our graph to exit. Tests will hang if there's anything that didn't exit
+        // properly.
+        test_kit.shutdown.trigger();
+        test_kit.graph.wait_for_shutdown().await;
     }
 }
