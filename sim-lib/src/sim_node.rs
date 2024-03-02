@@ -442,11 +442,12 @@ impl<'a, T: SimNetwork> SimNode<'a, T> {
     /// on its behalf. The pathfinding graph is provided separately so that each node can handle its own pathfinding.
     pub fn new(
         pubkey: PublicKey,
+        alias: Option<String>,
         payment_network: Arc<Mutex<T>>,
         pathfinding_graph: Arc<NetworkGraph<&'a WrappedLog>>,
     ) -> Self {
         SimNode {
-            info: node_info(pubkey),
+            info: node_info(pubkey, alias),
             network: payment_network,
             in_flight: HashMap::new(),
             pathfinding_graph,
@@ -455,14 +456,14 @@ impl<'a, T: SimNetwork> SimNode<'a, T> {
 }
 
 /// Produces the node info for a mocked node, filling in the features that the simulator requires.
-fn node_info(pubkey: PublicKey) -> NodeInfo {
+fn node_info(pubkey: PublicKey, alias: Option<String>) -> NodeInfo {
     // Set any features that the simulator requires here.
     let mut features = NodeFeatures::empty();
     features.set_keysend_optional();
 
     NodeInfo {
         pubkey,
-        alias: "".to_string(), // TODO: store alias?
+        alias: alias.unwrap_or_default(),
         features,
     }
 }
@@ -611,9 +612,9 @@ impl<T: SimNetwork> LightningNode for SimNode<'_, T> {
 
 /// Graph is the top level struct that is used to coordinate simulation of lightning nodes.
 pub struct SimGraph<C: Clock> {
-    /// nodes caches the list of nodes in the network with a vector of their channel capacities, only used for quick
-    /// lookup.
-    nodes: HashMap<PublicKey, Vec<u64>>,
+    /// nodes caches the list of nodes in the network with a vector of their channel capacities and their aliases,
+    /// only used for quick lookups.
+    nodes: HashMap<PublicKey, (Vec<u64>, Option<String>)>,
 
     /// channels maps the scid of a channel to its current simulation state.
     channels: Arc<Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
@@ -638,20 +639,20 @@ impl<C: Clock> SimGraph<C> {
         write_results: Option<WriteResults>,
         shutdown_trigger: Trigger,
     ) -> Result<Self, LdkError> {
-        let mut nodes: HashMap<PublicKey, Vec<u64>> = HashMap::new();
+        let mut nodes: HashMap<PublicKey, (Vec<u64>, Option<String>)> = HashMap::new();
         let mut channels = HashMap::new();
 
-        for channel in graph_channels.iter() {
-            channels.insert(channel.short_channel_id, channel.clone());
-
-            for pubkey in [channel.node_1.policy.pubkey, channel.node_2.policy.pubkey] {
-                match nodes.entry(pubkey) {
-                    Entry::Occupied(o) => o.into_mut().push(channel.capacity_msat),
+        for channel in graph_channels.into_iter() {
+            for policy in [channel.node_1.policy.clone(), channel.node_2.policy.clone()] {
+                match nodes.entry(policy.pubkey) {
+                    Entry::Occupied(o) => o.into_mut().0.push(channel.capacity_msat),
                     Entry::Vacant(v) => {
-                        v.insert(vec![channel.capacity_msat]);
+                        v.insert((vec![channel.capacity_msat], policy.alias));
                     },
                 }
             }
+
+            channels.insert(channel.short_channel_id, channel);
         }
 
         // Once off create the file we'll be writing to and add our own headers.
@@ -707,11 +708,12 @@ pub async fn ln_node_from_graph<'a, C: Clock + 'static>(
 ) -> HashMap<PublicKey, Arc<Mutex<dyn LightningNode + '_>>> {
     let mut nodes: HashMap<PublicKey, Arc<Mutex<dyn LightningNode>>> = HashMap::new();
 
-    for pk in graph.lock().await.nodes.keys() {
+    for (pk, (_, alias)) in graph.lock().await.nodes.iter() {
         nodes.insert(
             *pk,
             Arc::new(Mutex::new(SimNode::new(
                 *pk,
+                alias.clone(),
                 graph.clone(),
                 routing_graph.clone(),
             ))),
@@ -830,7 +832,7 @@ impl<C: Clock + 'static> SimNetwork for SimGraph<C> {
     async fn lookup_node(&self, node: &PublicKey) -> Result<(NodeInfo, Vec<u64>), LightningError> {
         self.nodes
             .get(node)
-            .map(|channels| (node_info(*node), channels.clone()))
+            .map(|(channels, alias)| (node_info(*node, alias.clone()), channels.clone()))
             .ok_or(LightningError::GetNodeInfoError(
                 "Node not found".to_string(),
             ))
@@ -1610,7 +1612,7 @@ mod tests {
 
         // Create a simulated node for the first channel in our network.
         let pk = channels[0].node_1.policy.pubkey;
-        let mut node = SimNode::new(pk, sim_network.clone(), Arc::new(graph));
+        let mut node = SimNode::new(pk, None, sim_network.clone(), Arc::new(graph));
 
         // Prime mock to return node info from lookup and assert that we get the pubkey we're expecting.
         let lookup_pk = channels[3].node_1.policy.pubkey;
@@ -1618,7 +1620,7 @@ mod tests {
             .lock()
             .await
             .expect_lookup_node()
-            .returning(move |_| Ok((node_info(lookup_pk), vec![1, 2, 3])));
+            .returning(move |_| Ok((node_info(lookup_pk, None), vec![1, 2, 3])));
 
         // Assert that we get three channels from the mock.
         let node_info = node.get_node_info(&lookup_pk).await.unwrap();
