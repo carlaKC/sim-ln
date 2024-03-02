@@ -1054,7 +1054,7 @@ async fn propagate_payment<C: Clock>(
     } else {
         // If we successfully added the htlc, go ahead and remove all the htlcs in the route with successful resolution.
         match remove_htlcs(
-            nodes,
+            nodes.clone(),
             route.hops.len(),
             source,
             route.clone(),
@@ -1068,7 +1068,21 @@ async fn propagate_payment<C: Clock>(
             // disk. We do not expect this operation to fail and can shutdown if it does.
             Ok(htlcs) => {
                 if let Some(w) = writer {
-                    if let Err(e) = write_forwards(w, htlcs, route).await {
+                    let mut aliases: HashMap<PublicKey, Option<String>> = HashMap::new();
+                    // TODO: make this better and filter by only channels that are contained in the route so that we
+                    // don't have to copy all channels each time. Google whether there's a quick way to turn into a map.
+                    nodes.lock().await.iter().for_each(|(_, channel)| {
+                        let _ = aliases.insert(
+                            channel.node_1.policy.pubkey,
+                            channel.node_1.policy.alias.clone(),
+                        );
+                        let _ = aliases.insert(
+                            channel.node_2.policy.pubkey,
+                            channel.node_2.policy.alias.clone(),
+                        );
+                    });
+
+                    if let Err(e) = write_forwards(w, htlcs, route, aliases).await {
                         log::error!("Could not write forwards: {e}");
                         shutdown.trigger();
                     }
@@ -1109,6 +1123,7 @@ struct HtlcForward {
     #[serde(with = "serializers::serde_system_time")]
     outgoing_remove_ts: SystemTime,
     forwarding_node: PublicKey,
+    forwarding_node_alias: String,
     chan_in: u64,
     chan_out: u64,
 }
@@ -1121,6 +1136,7 @@ async fn write_forwards(
     writer: Arc<Mutex<BatchedWriter>>,
     htlcs: Vec<Htlc>,
     path: Path,
+    aliases: HashMap<PublicKey, Option<String>>,
 ) -> Result<(), SimulationError> {
     if htlcs.len() <= 1 {
         return Ok(());
@@ -1152,6 +1168,13 @@ async fn write_forwards(
             outgoing_add_ts: outgoing_htlc.add_ts,
             outgoing_remove_ts: outgoing_htlc.remove_ts.unwrap(),
             forwarding_node: path.hops[i - 1].pubkey,
+            // Allow an empty alias if there's nothing stored for the node.
+            forwarding_node_alias: aliases
+                .get(&path.hops[i - 1].pubkey)
+                .expect("node not provided in aliases map")
+                .clone()
+                .unwrap_or_default()
+                .to_string(),
             chan_in: path.hops[i - 1].short_channel_id,
             chan_out: path.hops[i].short_channel_id,
         })?;
