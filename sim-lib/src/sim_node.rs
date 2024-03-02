@@ -116,6 +116,7 @@ struct Htlc {
 #[derive(Clone)]
 pub struct ChannelPolicy {
     pub pubkey: PublicKey,
+    pub alias: Option<String>,
     pub max_htlc_count: u64,
     pub max_in_flight_msat: u64,
     pub min_htlc_size_msat: u64,
@@ -1211,6 +1212,7 @@ mod tests {
 
         let policy = ChannelPolicy {
             pubkey: pk,
+            alias: Default::default(),
             max_htlc_count: 10,
             max_in_flight_msat,
             min_htlc_size_msat: 2,
@@ -1559,6 +1561,7 @@ mod tests {
 
             let node_1_to_2 = ChannelPolicy {
                 pubkey: node_1,
+                alias: None,
                 max_htlc_count: 483,
                 max_in_flight_msat: capacity / 2,
                 min_htlc_size_msat: 1,
@@ -1570,6 +1573,7 @@ mod tests {
 
             let node_2_to_1 = ChannelPolicy {
                 pubkey: node_2,
+                alias: None,
                 max_htlc_count: 483,
                 max_in_flight_msat: capacity / 2,
                 min_htlc_size_msat: 1,
@@ -1686,6 +1690,7 @@ mod tests {
         capacity: u64,
     ) -> SimulatedChannel {
         let source_policy = ChannelPolicy {
+            alias: None,
             pubkey: source,
             max_htlc_count: 483,
             max_in_flight_msat: capacity,
