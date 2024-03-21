@@ -643,11 +643,22 @@ impl<T: SimNetwork> LightningNode for SimNode<'_, T> {
     }
 }
 
+/// Stores information about simulated nodes for quick lookup.
+struct GraphNodeInfo {
+    channel_capacities: Vec<u64>,
+}
+
+impl GraphNodeInfo {
+    fn new(channel_capacities: Vec<u64>) -> Self {
+        GraphNodeInfo { channel_capacities }
+    }
+}
+
 /// Graph is the top level struct that is used to coordinate simulation of lightning nodes.
 pub struct SimGraph {
     /// nodes caches the list of nodes in the network with a vector of their channel capacities, only used for quick
     /// lookup.
-    nodes: HashMap<PublicKey, Vec<u64>>,
+    nodes: HashMap<PublicKey, GraphNodeInfo>,
 
     /// channels maps the scid of a channel to its current simulation state.
     channels: Arc<Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
@@ -668,7 +679,7 @@ impl SimGraph {
         clock: Arc<dyn Clock>,
         shutdown_trigger: Trigger,
     ) -> Result<Self, SimulationError> {
-        let mut nodes: HashMap<PublicKey, Vec<u64>> = HashMap::new();
+        let mut nodes: HashMap<PublicKey, GraphNodeInfo> = HashMap::new();
         let mut channels = HashMap::new();
 
         for channel in graph_channels.iter() {
@@ -686,11 +697,13 @@ impl SimGraph {
             };
 
             // It's okay to have duplicate pubkeys because one node can have many channels.
-            for pubkey in [channel.node_1.policy.pubkey, channel.node_2.policy.pubkey] {
-                match nodes.entry(pubkey) {
-                    Entry::Occupied(o) => o.into_mut().push(channel.capacity_msat),
+            for policy in [&channel.node_1.policy, &channel.node_2.policy] {
+                match nodes.entry(policy.pubkey) {
+                    Entry::Occupied(o) => {
+                        o.into_mut().channel_capacities.push(channel.capacity_msat)
+                    },
                     Entry::Vacant(v) => {
-                        v.insert(vec![channel.capacity_msat]);
+                        v.insert(GraphNodeInfo::new(vec![channel.capacity_msat]));
                     },
                 }
             }
@@ -843,10 +856,13 @@ impl SimNetwork for SimGraph {
     }
 
     /// lookup_node fetches a node's information and channel capacities.
-    async fn lookup_node(&self, node: &PublicKey) -> Result<(NodeInfo, Vec<u64>), LightningError> {
+    async fn lookup_node(
+        &self,
+        pubkey: &PublicKey,
+    ) -> Result<(NodeInfo, Vec<u64>), LightningError> {
         self.nodes
-            .get(node)
-            .map(|channels| (node_info(*node), channels.clone()))
+            .get(pubkey)
+            .map(|sim_node_info| (node_info(*pubkey), sim_node_info.channel_capacities.clone()))
             .ok_or(LightningError::GetNodeInfoError(
                 "Node not found".to_string(),
             ))
