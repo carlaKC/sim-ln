@@ -197,6 +197,8 @@ pub enum SimulationError {
     MpscChannelError(String),
     #[error("Payment Generation Error: {0}")]
     PaymentGenerationError(PaymentGenerationError),
+    #[error("Simulated Time Error: {0}")]
+    SimulatedTimeError(String),
 }
 
 #[derive(Debug, Error)]
