@@ -197,17 +197,17 @@ async fn create_simulation(
         for sim_channel in sim_network {
             nodes_info.insert(
                 sim_channel.node_1.pubkey,
-                node_info(sim_channel.node_1.pubkey),
+                node_info(sim_channel.node_1.pubkey, sim_channel.node_1.alias.clone()),
             );
             nodes_info.insert(
                 sim_channel.node_2.pubkey,
-                node_info(sim_channel.node_2.pubkey),
+                node_info(sim_channel.node_2.pubkey, sim_channel.node_1.alias.clone()),
             );
         }
 
         let get_node = |pk: &PublicKey| -> Result<NodeInfo, LightningError> {
             if let Some(node) = nodes_info.get(pk) {
-                Ok(node_info(node.pubkey))
+                Ok(node.clone())
             } else {
                 Err(LightningError::GetNodeInfoError(format!(
                     "node not found in simulated network: {}",
