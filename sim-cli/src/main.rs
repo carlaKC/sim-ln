@@ -1,4 +1,5 @@
 use bitcoin::secp256k1::PublicKey;
+use sim_lib::clock::SystemClock;
 use sim_lib::sim_node::{ln_node_from_graph, populate_network_graph, SimGraph, SimulatedChannel};
 use sim_lib::{ActivityParser, NetworkParser, NodeInfo, SimulationError};
 use std::collections::HashMap;
@@ -112,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
 /// will return the simulated graph as well.
 async fn create_simulation(
     cli: &Cli,
-) -> Result<(Simulation, Option<Arc<Mutex<SimGraph>>>), anyhow::Error> {
+) -> Result<(Simulation<SystemClock>, Option<Arc<Mutex<SimGraph>>>), anyhow::Error> {
     let sim_path = read_sim_path(cli.data_dir.clone(), cli.sim_file.clone()).await?;
     let SimParams { nodes, sim_network: sim_nodes, activity } = serde_json::from_str(&std::fs::read_to_string(sim_path)?)
         .map_err(|e| {
@@ -168,6 +169,7 @@ async fn create_simulation(
             cli.expected_pmt_amt,
             cli.capacity_multiplier,
             write_results,
+            SystemClock {},
             (shutdown_trigger, shutdown_listener),
         ),
         graph,

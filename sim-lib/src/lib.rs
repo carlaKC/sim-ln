@@ -1,3 +1,4 @@
+use self::clock::Clock;
 use self::defined_activity::DefinedPaymentActivity;
 use self::random_activity::{NetworkGraphView, RandomPaymentActivity};
 use self::sim_node::ChannelPolicy;
@@ -391,7 +392,7 @@ enum SimulationOutput {
 }
 
 #[derive(Clone)]
-pub struct Simulation {
+pub struct Simulation<C: Clock> {
     /// The lightning node that is being simulated.
     nodes: HashMap<PublicKey, Arc<Mutex<dyn LightningNode>>>,
     /// The activity that are to be executed on the node.
@@ -408,6 +409,8 @@ pub struct Simulation {
     activity_multiplier: f64,
     /// Configurations for printing results to CSV. Results are not written if this option is None.
     write_results: Option<WriteResults>,
+    /// Clock that handles time for the simulation.
+    clock: C,
 }
 
 #[derive(Clone)]
@@ -428,7 +431,7 @@ struct ExecutorKit {
     payment_generator: Box<dyn PaymentGenerator>,
 }
 
-impl Simulation {
+impl<C: Clock + 'static> Simulation<C> {
     pub fn new(
         nodes: HashMap<PublicKey, Arc<Mutex<dyn LightningNode>>>,
         activity: Vec<ActivityDefinition>,
@@ -436,6 +439,7 @@ impl Simulation {
         expected_payment_msat: u64,
         activity_multiplier: f64,
         write_results: Option<WriteResults>,
+        clock: C,
         shutdown: (Trigger, Listener),
     ) -> Self {
         Self {
@@ -447,6 +451,7 @@ impl Simulation {
             expected_payment_msat,
             activity_multiplier,
             write_results,
+            clock,
         }
     }
 
@@ -640,12 +645,14 @@ impl Simulation {
 
         let result_logger_clone = result_logger.clone();
         let result_logger_listener = listener.clone();
+        let clock = self.clock.clone();
         tasks.spawn(async move {
             log::debug!("Starting results logger.");
             run_results_logger(
                 result_logger_listener,
                 result_logger_clone,
                 Duration::from_secs(60),
+                clock,
             )
             .await;
             log::debug!("Exiting results logger.");
@@ -653,10 +660,12 @@ impl Simulation {
 
         // csr: consume simulation results
         let csr_write_results = self.write_results.clone();
+        let clock = self.clock.clone();
         tasks.spawn(async move {
             log::debug!("Staring simulation results consumer.");
             if let Err(e) = consume_simulation_results(
                 result_logger,
+                clock,
                 results_receiver,
                 listener,
                 csr_write_results,
@@ -785,11 +794,12 @@ impl Simulation {
             let ce_shutdown = self.shutdown_trigger.clone();
             let ce_output_sender = output_sender.clone();
             let ce_node = node.clone();
+            let clock = self.clock.clone();
             tasks.spawn(async move {
                 let node_info = ce_node.lock().await.get_info().clone();
                 log::debug!("Starting events consumer for {}.", node_info);
                 if let Err(e) =
-                    consume_events(ce_node, receiver, ce_output_sender, ce_listener).await
+                    consume_events(ce_node, clock, receiver, ce_output_sender, ce_listener).await
                 {
                     ce_shutdown.trigger();
                     log::error!("Event consumer exited with error: {e:?}.");
@@ -822,6 +832,8 @@ impl Simulation {
             let pe_shutdown = self.shutdown_trigger.clone();
             let pe_listener = self.shutdown_listener.clone();
             let pe_sender = sender.clone();
+            let clock = self.clock.clone();
+
             tasks.spawn(async move {
                 let source = executor.source_info.clone();
 
@@ -835,6 +847,7 @@ impl Simulation {
                     executor.source_info,
                     executor.network_generator,
                     executor.payment_generator,
+                    clock,
                     pe_sender,
                     pe_listener,
                 )
@@ -854,8 +867,9 @@ impl Simulation {
 
 /// events that are crated for a lightning node that we can execute events on. Any output that is generated from the
 /// event being executed is piped into a channel to handle the result of the event.
-async fn consume_events(
+async fn consume_events<C: Clock>(
     node: Arc<Mutex<dyn LightningNode>>,
+    clock: C,
     mut receiver: Receiver<SimulationEvent>,
     sender: Sender<SimulationOutput>,
     listener: Listener,
@@ -877,7 +891,7 @@ async fn consume_events(
                                 hash: None,
                                 amount_msat: amt_msat,
                                 destination: dest.pubkey,
-                                dispatch_time: SystemTime::now(),
+                                dispatch_time: clock.now(),
                             };
 
                             let outcome = match node.send_payment(dest.pubkey, amt_msat).await {
@@ -926,10 +940,15 @@ async fn consume_events(
 
 /// produce events generates events for the activity description provided. It accepts a shutdown listener so it can
 /// exit if other threads signal that they have errored out.
-async fn produce_events<N: DestinationGenerator + ?Sized, A: PaymentGenerator + ?Sized>(
+async fn produce_events<
+    N: DestinationGenerator + ?Sized,
+    A: PaymentGenerator + ?Sized,
+    C: Clock,
+>(
     source: NodeInfo,
     network_generator: Arc<Mutex<N>>,
     node_generator: Box<A>,
+    clock: C,
     sender: Sender<SimulationEvent>,
     listener: Listener,
 ) -> Result<(), SimulationError> {
@@ -944,7 +963,7 @@ async fn produce_events<N: DestinationGenerator + ?Sized, A: PaymentGenerator + 
             },
             // Wait until our time to next payment has elapsed then execute a random amount payment to a random
             // destination.
-            _ = time::sleep(wait) => {
+            _ = clock.sleep(wait) => {
                 let (destination, capacity) = network_generator.lock().await.choose_destination(source.pubkey);
 
                 // Only proceed with a payment if the amount is non-zero, otherwise skip this round. If we can't get
@@ -976,15 +995,16 @@ async fn produce_events<N: DestinationGenerator + ?Sized, A: PaymentGenerator + 
     }
 }
 
-async fn consume_simulation_results(
+async fn consume_simulation_results<C: Clock>(
     logger: Arc<Mutex<PaymentResultLogger>>,
+    clock: C,
     mut receiver: Receiver<(Payment, PaymentResult)>,
     listener: Listener,
     write_results: Option<WriteResults>,
 ) -> Result<(), SimulationError> {
     let mut writer = match write_results {
         Some(res) => {
-            let duration = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?;
+            let duration = clock.now().duration_since(SystemTime::UNIX_EPOCH)?;
             let file = res
                 .results_dir
                 .join(format!("simulation_{:?}.csv", duration));
@@ -1072,10 +1092,11 @@ impl Display for PaymentResultLogger {
 /// Reports a summary of payment results at a duration specified by `interval`
 /// Note that `run_results_logger` does not error in any way, thus it has no
 /// trigger. It listens for triggers to ensure clean exit.
-async fn run_results_logger(
+async fn run_results_logger<C: Clock>(
     listener: Listener,
     logger: Arc<Mutex<PaymentResultLogger>>,
     interval: Duration,
+    clock: C,
 ) {
     log::info!("Summary of results will be reported every {:?}.", interval);
 
@@ -1086,7 +1107,7 @@ async fn run_results_logger(
                 break
             }
 
-            _ = time::sleep(interval) => {
+            _ = clock.sleep(interval) => {
                 log::info!("{}", logger.lock().await)
             }
         }
