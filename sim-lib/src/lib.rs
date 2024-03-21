@@ -225,7 +225,7 @@ pub enum LightningError {
     ListChannelsError(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NodeInfo {
     pub pubkey: PublicKey,
     pub alias: String,
