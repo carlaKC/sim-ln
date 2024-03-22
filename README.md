@@ -333,6 +333,11 @@ Note that you need to provide forwarding policies in each direction,
 because each participant in the channel sets their own forwarding 
 policy and restrictions on their counterparty. 
 
+When running on a simulated network, the option is available to speed 
+up the simulator's wall clock time using a multiplier specified in 
+`--clock-speedup`. By default, this simulation mode will run at regular 
+wall clock speed.
+
 ### Inclusions and Limitations
 
 The simulator will execute payments on the mocked out network as it 
