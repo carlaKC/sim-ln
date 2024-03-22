@@ -16,8 +16,8 @@ use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::marker::Send;
 use std::path::PathBuf;
-use std::time::{SystemTimeError, UNIX_EPOCH};
-use std::{collections::HashMap, sync::Arc, time::SystemTime};
+use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
+use std::{collections::HashMap, sync::Arc};
 use thiserror::Error;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Mutex;
@@ -481,10 +481,11 @@ impl Simulation {
         activity: Vec<ActivityDefinition>,
     ) -> Result<(Self, Arc<Mutex<SimGraph>>), SimulationError> {
         let (shutdown_trigger, shutdown_listener) = triggered::trigger();
+        let clock = Arc::new(SimulationClock::new(1)?);
 
         // Setup a simulation graph that will handle propagation of payments through the network.
         let simulation_graph = Arc::new(Mutex::new(
-            SimGraph::new(channels.clone(), shutdown_trigger.clone())
+            SimGraph::new(channels.clone(), clock.clone(), shutdown_trigger.clone())
                 .map_err(|e| SimulationError::SimulatedNetworkError(format!("{:?}", e)))?,
         ));
 
@@ -492,7 +493,7 @@ impl Simulation {
         // payments without locking the simulation graph (this is a duplication of our channels, but the performance
         // tradeoff is worthwhile for concurrent pathfinding).
         let routing_graph = Arc::new(
-            populate_network_graph(channels)
+            populate_network_graph(channels, clock.clone())
                 .map_err(|e| SimulationError::SimulatedNetworkError(format!("{:?}", e)))?,
         );
 
@@ -505,7 +506,7 @@ impl Simulation {
                 shutdown_trigger,
                 shutdown_listener,
                 cfg,
-                clock: Arc::new(SimulationClock::new(1)?),
+                clock,
             },
             simulation_graph,
         ))
