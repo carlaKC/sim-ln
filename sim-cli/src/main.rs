@@ -31,6 +31,9 @@ pub const ACTIVITY_MULTIPLIER: f64 = 2.0;
 /// Default batch size to flush result data to disk
 const DEFAULT_PRINT_BATCH_SIZE: u32 = 500;
 
+/// Default value for speeding up the clock when running on a simulated network.
+const DEFAULT_CLOCK_SPEEDUP: u32 = 1;
+
 /// Deserializes a f64 as long as it is positive and greater than 0.
 fn deserialize_f64_greater_than_zero(x: String) -> Result<f64, String> {
     match x.parse::<f64>() {
@@ -79,6 +82,9 @@ struct Cli {
     /// Seed to run random activity generator deterministically
     #[clap(long, short)]
     fix_seed: Option<u64>,
+    /// Speedup multiplier for wall clock when running in simulated network mode.
+    #[clap(long, short)]
+    clock_speedup: Option<u32>,
 }
 
 #[tokio::main]
@@ -158,6 +164,10 @@ async fn create_simulation(
                 "Simulation file must contain nodes to run with real lightning nodes or sim_graph to run with 
                 simulated nodes",
         ))
+    } else if !nodes.is_empty() && cli.clock_speedup.is_some() {
+        Err(anyhow!(
+            "Simulation speedup is only available when running in simulated network mode",
+        ))
     } else if !nodes.is_empty() {
         let (clients, clients_info) = connect_nodes(nodes).await?;
         // We need to be able to look up destination nodes in the graph, because we allow defined activities to send to
@@ -208,8 +218,13 @@ async fn create_simulation(
 
         let validated_activities = validate_activities(activity, &nodes_info, get_node).await?;
 
-        let (simulation, graph) =
-            Simulation::new_with_sim_network(cfg, channels, validated_activities).await?;
+        let (simulation, graph) = Simulation::new_with_sim_network(
+            cfg,
+            channels,
+            validated_activities,
+            cli.clock_speedup.unwrap_or(DEFAULT_CLOCK_SPEEDUP),
+        )
+        .await?;
         Ok((simulation, Some(graph)))
     }
 }
