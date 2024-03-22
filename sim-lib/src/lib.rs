@@ -580,13 +580,16 @@ impl Simulation {
         }
     }
 
+    /// Creates a payment simulation that's running on a simulated set of channels. As this simulation has no
+    /// underlying nodes it can optionally be sped up by some multiplying factor.
     pub async fn new_with_sim_network(
         cfg: SimulationCfg,
         channels: Vec<SimulatedChannel>,
         activity: Vec<ActivityDefinition>,
+        clock_speedup: u32,
     ) -> Result<(Self, Arc<Mutex<SimGraph>>), SimulationError> {
         let (shutdown_trigger, shutdown_listener) = triggered::trigger();
-        let clock = Arc::new(SimulationClock::new(1)?);
+        let clock = Arc::new(SimulationClock::new(clock_speedup)?);
 
         // Setup a simulation graph that will handle propagation of payments through the network.
         let simulation_graph = Arc::new(Mutex::new(
