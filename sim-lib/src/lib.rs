@@ -5,6 +5,7 @@ use self::random_activity::{NetworkGraphView, RandomPaymentActivity};
 use self::sim_node::{
     ln_node_from_graph, populate_network_graph, ChannelPolicy, SimGraph, SimulatedChannel,
 };
+use crate::random_activity::new_mut_rng;
 use async_trait::async_trait;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::Network;
@@ -27,6 +28,7 @@ use tokio::{select, time, time::Duration};
 use triggered::{Listener, Trigger};
 
 mod batched_writer;
+
 pub mod cln;
 pub mod clock;
 mod defined_activity;
@@ -256,6 +258,8 @@ pub enum SimulationError {
     PaymentGenerationError(PaymentGenerationError),
     #[error("Simulated Time Error: {0}")]
     SimulatedTimeError(String),
+    #[error("Destination Generation Error: {0}")]
+    DestinationGenerationError(DestinationGenerationError),
 }
 
 #[derive(Debug, Error)]
@@ -325,10 +329,17 @@ pub trait LightningNode: Send {
     async fn list_channels(&mut self) -> Result<Vec<u64>, LightningError>;
 }
 
+#[derive(Debug, Error)]
+#[error("Destination generation error: {0}")]
+pub struct DestinationGenerationError(String);
+
 pub trait DestinationGenerator: Send {
     /// choose_destination picks a destination node within the network, returning the node's information and its
     /// capacity (if available).
-    fn choose_destination(&self, source: PublicKey) -> (NodeInfo, Option<u64>);
+    fn choose_destination(
+        &self,
+        source: PublicKey,
+    ) -> Result<(NodeInfo, Option<u64>), DestinationGenerationError>;
 }
 
 #[derive(Debug, Error)]
@@ -343,7 +354,7 @@ pub trait PaymentGenerator: Display + Send {
     fn payment_count(&self) -> Option<u64>;
 
     /// Returns the number of seconds that a node should wait until firing its next payment.
-    fn next_payment_wait(&self) -> time::Duration;
+    fn next_payment_wait(&self) -> Result<time::Duration, PaymentGenerationError>;
 
     /// Returns a payment amount based, with a destination capacity optionally provided to inform the amount picked.
     fn payment_amount(
@@ -468,6 +479,8 @@ pub struct SimulationCfg {
     activity_multiplier: f64,
     /// Configurations for printing results to CSV. Results are not written if this option is None.
     write_results: Option<WriteResults>,
+    /// Seed to deterministically run the random activity generator
+    seed: Option<u64>,
 }
 
 impl SimulationCfg {
@@ -476,12 +489,14 @@ impl SimulationCfg {
         expected_payment_msat: u64,
         activity_multiplier: f64,
         write_results: Option<WriteResults>,
+        seed: Option<u64>,
     ) -> Self {
         Self {
             total_time: total_time.map(|x| Duration::from_secs(x as u64)),
             expected_payment_msat,
             activity_multiplier,
             write_results,
+            seed,
         }
     }
 }
@@ -691,7 +706,7 @@ impl Simulation {
         self.run_data_collection(event_receiver, &mut tasks);
 
         // Get an execution kit per activity that we need to generate and spin up consumers for each source node.
-        let activities = match self.activity_executors().await {
+        let activities = match self.activity_executors(self.cfg.seed).await {
             Ok(a) => a,
             Err(e) => {
                 // If we encounter an error while setting up the activity_executors,
@@ -864,7 +879,10 @@ impl Simulation {
         log::debug!("Simulator data collection set up.");
     }
 
-    async fn activity_executors(&self) -> Result<Vec<ExecutorKit>, SimulationError> {
+    async fn activity_executors(
+        &self,
+        seed: Option<u64>,
+    ) -> Result<Vec<ExecutorKit>, SimulationError> {
         let mut generators = Vec::new();
 
         // Note: when we allow configuring both defined and random activity, this will no longer be an if/else, we'll
@@ -888,7 +906,7 @@ impl Simulation {
                 });
             }
         } else {
-            generators = self.random_activity_nodes().await?;
+            generators = self.random_activity_nodes(seed).await?;
         }
 
         Ok(generators)
@@ -896,7 +914,10 @@ impl Simulation {
 
     /// Returns the list of nodes that are eligible for generating random activity on. This is the subset of nodes
     /// that have sufficient capacity to generate payments of our expected payment amount.
-    async fn random_activity_nodes(&self) -> Result<Vec<ExecutorKit>, SimulationError> {
+    async fn random_activity_nodes(
+        &self,
+        seed: Option<u64>,
+    ) -> Result<Vec<ExecutorKit>, SimulationError> {
         // Collect capacity of each node from its view of its own channels. Total capacity is divided by two to
         // avoid double counting capacity (as each node has a counterparty in the channel).
         let mut generators = Vec::new();
@@ -923,8 +944,10 @@ impl Simulation {
             active_nodes.insert(node_info.pubkey, (node_info, capacity));
         }
 
+        let rng = new_mut_rng(seed);
+
         let network_generator = Arc::new(Mutex::new(
-            NetworkGraphView::new(active_nodes.values().cloned().collect())
+            NetworkGraphView::new(active_nodes.values().cloned().collect(), rng.clone())
                 .map_err(SimulationError::RandomActivityError)?,
         ));
 
@@ -942,6 +965,7 @@ impl Simulation {
                         *capacity,
                         self.cfg.expected_payment_msat,
                         self.cfg.activity_multiplier,
+                        rng.clone(),
                     )
                     .map_err(SimulationError::RandomActivityError)?,
                 ),
@@ -1158,7 +1182,9 @@ async fn produce_events<N: DestinationGenerator + ?Sized, A: PaymentGenerator + 
                 "Next payment for {source} in {:?}.",
                 node_generator.next_payment_wait()
             );
-            node_generator.next_payment_wait()
+            node_generator
+                .next_payment_wait()
+                .map_err(SimulationError::PaymentGenerationError)?
         };
 
         select! {
@@ -1169,7 +1195,7 @@ async fn produce_events<N: DestinationGenerator + ?Sized, A: PaymentGenerator + 
             // Wait until our time to next payment has elapsed then execute a random amount payment to a random
             // destination.
             _ = clock.sleep(wait) => {
-                let (destination, capacity) = network_generator.lock().await.choose_destination(source.pubkey);
+                let (destination, capacity) = network_generator.lock().await.choose_destination(source.pubkey).map_err(SimulationError::DestinationGenerationError)?;
 
                 // Only proceed with a payment if the amount is non-zero, otherwise skip this round. If we can't get
                 // a payment amount something has gone wrong (because we should have validated that we can always

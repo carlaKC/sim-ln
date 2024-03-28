@@ -83,6 +83,9 @@ struct Cli {
     /// Speedup multiplier for wall clock when running in simulated network mode.
     #[clap(long, short)]
     clock_speedup: Option<u32>,
+    /// Seed to run random activity generator "deterministically", i.e. in the same order.
+    #[clap(long, short)]
+    fix_seed: Option<u64>,
 }
 
 #[tokio::main]
@@ -108,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
         } else {
             None
         },
+        cli.fix_seed,
     );
 
     let (sim, sim_network) = create_simulation(&cli, sim_cfg).await?;
