@@ -273,7 +273,7 @@ async fn add_node_to_maps(
             node_info.pubkey
         );
 
-        if nodes.contains_key(&node_info.pubkey) {
+        if pk_node_map.contains_key(&node_info.pubkey) {
             return Err(LightningError::ValidationError(format!(
                 "duplicated node: {}.",
                 node_info.pubkey
