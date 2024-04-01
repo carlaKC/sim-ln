@@ -283,7 +283,7 @@ async fn add_node_to_maps(
         if !node_info.alias.is_empty() {
             if alias_node_map.contains_key(&node_info.alias) {
                 return Err(LightningError::ValidationError(format!(
-                    "duplicated node: {}.",
+                    "duplicated alias: {}.",
                     node_info.alias
                 )));
             }
