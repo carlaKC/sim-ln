@@ -19,11 +19,11 @@ use lightning::routing::router::{find_route, Path, PaymentParameters, Route, Rou
 use lightning::routing::scoring::ProbabilisticScorer;
 use lightning::routing::utxo::{UtxoLookup, UtxoResult};
 use lightning::util::logger::{Level, Logger, Record};
-use rand_distr::Poisson;
+use rand_distr::{Distribution, Poisson};
 use serde::{Deserialize, Serialize};
 use std::collections::{hash_map::Entry, HashMap};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::select;
 use tokio::sync::oneshot::{channel, Receiver, Sender};
@@ -902,6 +902,7 @@ impl SimNetwork for SimGraph {
             payment_hash,
             sender,
             self.writer.clone(),
+            self.latency,
             self.clock.clone(),
             self.shutdown_trigger.clone(),
         ));
@@ -948,6 +949,7 @@ async fn add_htlcs(
     source: PublicKey,
     route: Path,
     payment_hash: PaymentHash,
+    latency: Option<Poisson<f32>>,
     clock: Arc<dyn Clock>,
 ) -> Result<(), (Option<usize>, ForwardingError)> {
     let mut outgoing_node = source;
@@ -1099,6 +1101,7 @@ async fn propagate_payment(
     payment_hash: PaymentHash,
     sender: Sender<Result<PaymentResult, LightningError>>,
     writer: Option<Arc<Mutex<BatchedWriter>>>,
+    latency: Option<Poisson<f32>>,
     clock: Arc<dyn Clock>,
     shutdown: Trigger,
 ) {
@@ -1109,6 +1112,7 @@ async fn propagate_payment(
         source,
         route.clone(),
         payment_hash,
+        latency,
         clock.clone(),
     )
     .await
