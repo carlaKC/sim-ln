@@ -220,6 +220,11 @@ async fn create_simulation(
             channels,
             validated_activities,
             cli.clock_speedup.unwrap_or(DEFAULT_CLOCK_SPEEDUP),
+            // Assuming around 50ms RTT and 3x RTT per HTLC added:
+            // https://lists.linuxfoundation.org/pipermail/lightning-dev/2015-December/000391.html
+            //
+            // Hardcoding for now for ease of hackathon use.
+            Some(150.0),
         )
         .await?;
         Ok((simulation, Some(graph)))

@@ -19,6 +19,7 @@ use lightning::routing::router::{find_route, Path, PaymentParameters, Route, Rou
 use lightning::routing::scoring::ProbabilisticScorer;
 use lightning::routing::utxo::{UtxoLookup, UtxoResult};
 use lightning::util::logger::{Level, Logger, Record};
+use rand_distr::Poisson;
 use serde::{Deserialize, Serialize};
 use std::collections::{hash_map::Entry, HashMap};
 use std::sync::Arc;
@@ -681,6 +682,9 @@ pub struct SimGraph {
     /// Optional writer to flush htlc forwards to disk.
     writer: Option<Arc<Mutex<BatchedWriter>>>,
 
+    /// Optionally included to provide per-hop latency for simulated nodes, NB: expressed in milliseconds.
+    latency: Option<Poisson<f32>>,
+
     /// trigger shutdown if a critical error occurs.
     shutdown_trigger: Trigger,
 }
@@ -691,6 +695,7 @@ impl SimGraph {
         graph_channels: Vec<SimulatedChannel>,
         clock: Arc<dyn Clock>,
         write_results: Option<WriteResults>,
+        latency_ms: Option<f32>,
         shutdown_trigger: Trigger,
     ) -> Result<Self, SimulationError> {
         let mut nodes: HashMap<PublicKey, GraphNodeInfo> = HashMap::new();
@@ -741,6 +746,16 @@ impl SimGraph {
             channels: Arc::new(Mutex::new(channels)),
             clock,
             writer,
+            latency: if let Some(l) = latency_ms {
+                Some(Poisson::new(l).map_err(|e| {
+                    SimulationError::SimulatedNetworkError(format!(
+                        "could not create latency distribution: {}",
+                        e
+                    ))
+                })?)
+            } else {
+                None
+            },
             tasks: JoinSet::new(),
             shutdown_trigger,
         })
@@ -1004,7 +1019,15 @@ async fn add_htlcs(
         outgoing_amount -= hop.fee_msat;
         outgoing_cltv -= hop.cltv_expiry_delta;
 
-        // TODO: introduce artificial latency between hops?
+        if let Some(p) = latency {
+            let latency = p.sample(&mut rand::thread_rng());
+            log::trace!("Latency for simualted htlc: {latency}");
+
+            // TODO: include this in a select with listener otherwise we will have to wait for our latency sleep to
+            // be over before we can exit when the signal comes. This isn't dramatic because we're talking small values
+            // but it's a bit dirty.
+            clock.sleep(Duration::from_millis(latency as u64)).await;
+        }
     }
 
     Ok(())
@@ -1815,8 +1838,14 @@ mod tests {
 
             let clock = Arc::new(SystemClock {});
             let kit = DispatchPaymentTestKit {
-                graph: SimGraph::new(channels.clone(), clock.clone(), None, shutdown.clone())
-                    .expect("could not create test graph"),
+                graph: SimGraph::new(
+                    channels.clone(),
+                    clock.clone(),
+                    None,
+                    None,
+                    shutdown.clone(),
+                )
+                .expect("could not create test graph"),
                 nodes,
                 routing_graph: populate_network_graph(channels, clock).unwrap(),
                 shutdown,
