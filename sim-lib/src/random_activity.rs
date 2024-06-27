@@ -231,7 +231,7 @@ fn events_per_month(source_capacity_msat: u64, multiplier: f64, expected_payment
 impl PaymentGenerator for RandomPaymentActivity {
     /// Returns the time that the payments should start. This will always be 0 for the RandomPaymentActivity type.
     fn payment_start(&self) -> Duration {
-        Duration::from_secs(0)
+        self.next_payment_wait().unwrap()
     }
 
     /// Returns the number of payments that should be made. This will always be None for the RandomPaymentActivity type.

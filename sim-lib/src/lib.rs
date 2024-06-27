@@ -203,8 +203,7 @@ pub struct ActivityParser {
     #[serde(with = "serializers::serde_node_id")]
     pub destination: NodeId,
     /// The time in the simulation to start the payment.
-    #[serde(default)]
-    pub start_secs: u16,
+    pub start_secs: Option<u16>,
     /// The number of payments to send over the course of the simulation.
     #[serde(default)]
     pub count: Option<u64>,
@@ -225,7 +224,7 @@ pub struct ActivityDefinition {
     /// The destination of the payment.
     pub destination: NodeInfo,
     /// The time in the simulation to start the payment.
-    pub start_secs: u16,
+    pub start_secs: Option<u16>,
     /// The number of payments to send over the course of the simulation.
     pub count: Option<u64>,
     /// The interval of the event, as in every how many seconds the payment is performed.
@@ -891,7 +890,7 @@ impl Simulation {
             for description in self.activity.iter() {
                 let activity_generator = DefinedPaymentActivity::new(
                     description.destination.clone(),
-                    Duration::from_secs(description.start_secs.into()),
+                    description.start_secs,
                     description.count,
                     description.interval_secs,
                     description.amount_msat,
