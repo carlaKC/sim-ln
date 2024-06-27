@@ -32,6 +32,7 @@ type MutRng = Arc<Mutex<Box<dyn RngCore + Send>>>;
 // Creates a new rng for generating random activity, optionally using a fixed seed if provided.
 pub fn new_mut_rng(seed: Option<u64>) -> MutRng {
     if let Some(s) = seed {
+        log::info!("Generating random activity with fixed seed: {s}.");
         Arc::new(Mutex::new(Box::new(ChaCha8Rng::seed_from_u64(s))))
     } else {
         Arc::new(Mutex::new(Box::new(StdRng::from_entropy())))
