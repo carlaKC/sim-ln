@@ -1,5 +1,6 @@
 use crate::{
-    LightningError, LightningNode, NodeInfo, PaymentOutcome, PaymentResult, SimulationError,
+    clock::Clock, LightningError, LightningNode, NodeInfo, PaymentOutcome, PaymentResult,
+    SimulationError,
 };
 use async_trait::async_trait;
 use bitcoin::constants::ChainHash;
@@ -9,7 +10,7 @@ use bitcoin::{Network, ScriptBuf, TxOut};
 use lightning::ln::chan_utils::make_funding_redeemscript;
 use std::collections::{hash_map::Entry, HashMap};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 use lightning::ln::features::{ChannelFeatures, NodeFeatures};
 use lightning::ln::msgs::{
@@ -642,6 +643,8 @@ pub struct SimGraph {
     /// track all tasks spawned to process payments in the graph.
     tasks: JoinSet<()>,
 
+    clock: Arc<dyn Clock>,
+
     /// trigger shutdown if a critical error occurs.
     shutdown_trigger: Trigger,
 }
@@ -650,6 +653,7 @@ impl SimGraph {
     /// Creates a graph on which to simulate payments.
     pub fn new(
         graph_channels: Vec<SimulatedChannel>,
+        clock: Arc<dyn Clock>,
         shutdown_trigger: Trigger,
     ) -> Result<Self, SimulationError> {
         let mut nodes: HashMap<PublicKey, Vec<u64>> = HashMap::new();
@@ -683,6 +687,7 @@ impl SimGraph {
         Ok(SimGraph {
             nodes,
             channels: Arc::new(Mutex::new(channels)),
+            clock,
             tasks: JoinSet::new(),
             shutdown_trigger,
         })
@@ -706,7 +711,7 @@ impl SimGraph {
 /// Produces a map of node public key to lightning node implementation to be used for simulations.
 pub async fn ln_node_from_graph(
     graph: Arc<Mutex<SimGraph>>,
-    routing_graph: Arc<NetworkGraph<&'_ WrappedLog>>,
+    routing_graph: Arc<NetworkGraph<&'a WrappedLog>>,
 ) -> HashMap<PublicKey, Arc<Mutex<dyn LightningNode + '_>>> {
     let mut nodes: HashMap<PublicKey, Arc<Mutex<dyn LightningNode>>> = HashMap::new();
 
@@ -730,6 +735,7 @@ pub async fn ln_node_from_graph(
 /// (such as features) available in the routing graph.
 pub fn populate_network_graph<'a>(
     channels: Vec<SimulatedChannel>,
+    clock: Arc<dyn Clock>,
 ) -> Result<NetworkGraph<&'a WrappedLog>, LdkError> {
     let graph = NetworkGraph::new(Network::Regtest, &WrappedLog {});
 
@@ -768,10 +774,7 @@ pub fn populate_network_graph<'a>(
             let update = UnsignedChannelUpdate {
                 chain_hash,
                 short_channel_id: channel.short_channel_id.into(),
-                timestamp: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as u32,
+                timestamp: clock.now().duration_since(UNIX_EPOCH).unwrap().as_secs() as u32,
                 flags: i as u8,
                 cltv_expiry_delta: node.policy.cltv_expiry_delta as u16,
                 htlc_minimum_msat: node.policy.min_htlc_size_msat,
@@ -1088,6 +1091,7 @@ impl UtxoLookup for UtxoValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::SystemClock;
     use crate::test_utils::get_random_keypair;
     use bitcoin::secp256k1::PublicKey;
     use lightning::routing::router::Route;
@@ -1479,7 +1483,9 @@ mod tests {
         let mock = MockNetwork::new();
         let sim_network = Arc::new(Mutex::new(mock));
         let channels = create_simulated_channels(5, 300000000);
-        let graph = populate_network_graph(channels.clone()).unwrap();
+        let clock = Arc::new(SystemClock {});
+
+        let graph = populate_network_graph(channels.clone(), clock).unwrap();
 
         // Create a simulated node for the first channel in our network.
         let pk = channels[0].node_1.policy.pubkey;
@@ -1579,11 +1585,12 @@ mod tests {
                 .collect::<Vec<PublicKey>>();
             nodes.push(channels.last().unwrap().node_2.policy.pubkey);
 
+            let clock = Arc::new(SystemClock {});
             let kit = DispatchPaymentTestKit {
-                graph: SimGraph::new(channels.clone(), shutdown.clone())
+                graph: SimGraph::new(channels.clone(), clock.clone(), shutdown.clone())
                     .expect("could not create test graph"),
                 nodes,
-                routing_graph: populate_network_graph(channels).unwrap(),
+                routing_graph: populate_network_graph(channels, clock).unwrap(),
                 shutdown,
             };
 
