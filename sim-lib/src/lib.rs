@@ -319,6 +319,7 @@ pub trait DestinationGenerator: Send {
     /// capacity (if available).
     fn choose_destination(
         &self,
+        rng: MutRng,
         source: PublicKey,
     ) -> Result<(NodeInfo, Option<u64>), DestinationGenerationError>;
 }
@@ -335,11 +336,12 @@ pub trait PaymentGenerator: Display + Send {
     fn payment_count(&self) -> Option<u64>;
 
     /// Returns the number of seconds that a node should wait until firing its next payment.
-    fn next_payment_wait(&self) -> Result<time::Duration, PaymentGenerationError>;
+    fn next_payment_wait(&self, rng: MutRng) -> Result<time::Duration, PaymentGenerationError>;
 
     /// Returns a payment amount based, with a destination capacity optionally provided to inform the amount picked.
     fn payment_amount(
         &self,
+        rng: MutRng,
         destination_capacity: Option<u64>,
     ) -> Result<u64, PaymentGenerationError>;
 }
@@ -460,7 +462,7 @@ type MutRngType = Arc<StdMutex<Box<dyn RngCore + Send>>>;
 /// Newtype for `MutRngType` to encapsulate and hide implementation details for
 /// creating new `MutRngType` types. Provides convenient API for the same purpose.
 #[derive(Clone)]
-struct MutRng(pub MutRngType);
+pub struct MutRng(pub MutRngType);
 
 impl MutRng {
     /// Creates a new MutRng given an optional `u64` argument. If `seed_opt` is `Some`,
@@ -894,9 +896,8 @@ impl Simulation {
         // different orders result in different values for each task), so we aim to use one RNG per process to decrease
         // variance. The network generator is shared (because it holds the whole graph), so there will still be some
         // non-deterministic behavior when we pick destinations.
-        let network_rng = MutRng::new(self.cfg.seed, 0);
         let network_generator = Arc::new(Mutex::new(
-            NetworkGraphView::new(active_nodes.values().cloned().collect(), network_rng)
+            NetworkGraphView::new(active_nodes.values().cloned().collect())
                 .map_err(SimulationError::RandomActivityError)?,
         ));
 
@@ -906,12 +907,6 @@ impl Simulation {
         );
 
         for (node_info, capacity) in active_nodes.values() {
-            // Pubkey is only exposed via to_string API, so we grab the last 15 digits to get an identifier for this
-            // node to feed into our RNG creation below.
-            let pk_str = node_info.pubkey.to_string();
-            let pk = u64::from_str_radix(&pk_str[pk_str.len() - 15..], 16)
-                .map_err(|e| SimulationError::FixedSeedError(e.to_string()))?;
-
             generators.push(ExecutorKit {
                 source_info: node_info.clone(),
                 network_generator: network_generator.clone(),
@@ -920,14 +915,6 @@ impl Simulation {
                         *capacity,
                         self.cfg.expected_payment_msat,
                         self.cfg.activity_multiplier,
-                        // We create one RNG per payment activity generator so that when we have a fixed seed, each
-                        // generator will get the same set of values across runs (with a shared RNG, the order in
-                        // which tasks access the shared RNG would change the value that each generator gets). We
-                        // "salt" the set seed with a value based on the node's public key so that each generator will
-                        // start with a different seed, but it will be the same across runs. It is not critical is the
-                        // value is the same for two nodes (and it's very unlikely). We can't use an index here
-                        // because order of iteration through hashmaps is random.
-                        MutRng::new(self.cfg.seed, pk),
                     )
                     .map_err(SimulationError::RandomActivityError)?,
                 ),
@@ -1002,6 +989,8 @@ impl Simulation {
             let pe_shutdown = self.shutdown_trigger.clone();
             let pe_listener = self.shutdown_listener.clone();
             let pe_sender = sender.clone();
+            let pe_seed = self.cfg.seed;
+
             tasks.spawn(async move {
                 let source = executor.source_info.clone();
 
@@ -1016,6 +1005,7 @@ impl Simulation {
                     executor.network_generator,
                     executor.payment_generator,
                     pe_sender,
+                    pe_seed,
                     pe_listener,
                 )
                 .await
@@ -1111,6 +1101,7 @@ async fn produce_events<N: DestinationGenerator + ?Sized, A: PaymentGenerator + 
     network_generator: Arc<Mutex<N>>,
     node_generator: Box<A>,
     sender: Sender<SimulationEvent>,
+    seed: Option<u64>,
     listener: Listener,
 ) -> Result<(), SimulationError> {
     let mut current_count = 0;
@@ -1124,7 +1115,22 @@ async fn produce_events<N: DestinationGenerator + ?Sized, A: PaymentGenerator + 
             }
         }
 
-        let wait = get_payment_delay(current_count, &source, node_generator.as_ref())?;
+        // Pubkey is only exposed via to_string API, so we grab the last 15 digits to get an identifier for this
+        // node to feed into our RNG creation below.
+        let pk_str = source.pubkey.to_string();
+        let pk = u64::from_str_radix(&pk_str[pk_str.len() - 15..], 16)
+            .map_err(|e| SimulationError::FixedSeedError(e.to_string()))?;
+
+        // We create one RNG per payment activity generator so that when we have a fixed seed, each
+        // generator will get the same set of values across runs (with a shared RNG, the order in
+        // which tasks access the shared RNG would change the value that each generator gets). We
+        // "salt" the set seed with a value based on the node's public key so that each generator will
+        // start with a different seed, but it will be the same across runs. It is not critical is the
+        // value is the same for two nodes (and it's very unlikely). We can't use an index here
+        // because order of iteration through hashmaps is random.
+        let rng = MutRng::new(seed, pk);
+
+        let wait = get_payment_delay(current_count, &source, node_generator.as_ref(), rng.clone())?;
 
         select! {
             biased;
@@ -1134,12 +1140,12 @@ async fn produce_events<N: DestinationGenerator + ?Sized, A: PaymentGenerator + 
             // Wait until our time to next payment has elapsed then execute a random amount payment to a random
             // destination.
             _ = time::sleep(wait) => {
-                let (destination, capacity) = network_generator.lock().await.choose_destination(source.pubkey).map_err(SimulationError::DestinationGenerationError)?;
+                let (destination, capacity) = network_generator.lock().await.choose_destination(rng.clone(), source.pubkey).map_err(SimulationError::DestinationGenerationError)?;
 
                 // Only proceed with a payment if the amount is non-zero, otherwise skip this round. If we can't get
                 // a payment amount something has gone wrong (because we should have validated that we can always
                 // generate amounts), so we exit.
-                let amount = match node_generator.payment_amount(capacity) {
+                let amount = match node_generator.payment_amount(rng,capacity) {
                     Ok(amt) => {
                         if amt == 0 {
                             log::debug!("Skipping zero amount payment for {source} -> {destination}.");
@@ -1172,6 +1178,7 @@ fn get_payment_delay<A: PaymentGenerator + ?Sized>(
     call_count: u64,
     source: &NodeInfo,
     node_generator: &A,
+    rng: MutRng,
 ) -> Result<Duration, SimulationError> {
     // Note: we can't check if let Some() && call_count (syntax not allowed) so we add an additional branch in here.
     // The alternative is to call payment_start twice (which is _technically_ fine because it always returns the same
@@ -1179,7 +1186,7 @@ fn get_payment_delay<A: PaymentGenerator + ?Sized>(
     // don't have to make any assumptions about the underlying operation of payment_start.
     if call_count != 0 {
         let wait = node_generator
-            .next_payment_wait()
+            .next_payment_wait(rng)
             .map_err(SimulationError::PaymentGenerationError)?;
         log::debug!("Next payment for {source} in {:?}.", wait);
         Ok(wait)
@@ -1191,7 +1198,7 @@ fn get_payment_delay<A: PaymentGenerator + ?Sized>(
         Ok(start)
     } else {
         let wait = node_generator
-            .next_payment_wait()
+            .next_payment_wait(rng)
             .map_err(SimulationError::PaymentGenerationError)?;
         log::debug!("First payment for {source} in {:?}.", wait);
         Ok(wait)
@@ -1475,8 +1482,8 @@ mod tests {
         impl PaymentGenerator for Generator {
             fn payment_start(&self) -> Option<Duration>;
             fn payment_count(&self) -> Option<u64>;
-            fn next_payment_wait(&self) -> Result<Duration, PaymentGenerationError>;
-            fn payment_amount(&self, destination_capacity: Option<u64>) -> Result<u64, PaymentGenerationError>;
+            fn next_payment_wait(&self, rng: MutRng) -> Result<Duration, PaymentGenerationError>;
+            fn payment_amount(&self,rng: MutRng, destination_capacity: Option<u64>) -> Result<u64, PaymentGenerationError>;
         }
     }
 
@@ -1494,14 +1501,14 @@ mod tests {
         let payment_interval = Duration::from_secs(5);
         mock_generator
             .expect_next_payment_wait()
-            .returning(move || Ok(payment_interval));
+            .returning(move |_| Ok(payment_interval));
 
         assert_eq!(
-            get_payment_delay(0, &node, &mock_generator).unwrap(),
+            get_payment_delay(0, &node, &mock_generator, MutRng::new(None, 0)).unwrap(),
             payment_interval
         );
         assert_eq!(
-            get_payment_delay(1, &node, &mock_generator).unwrap(),
+            get_payment_delay(1, &node, &mock_generator, MutRng::new(None, 0)).unwrap(),
             payment_interval
         );
     }
@@ -1523,14 +1530,14 @@ mod tests {
         let payment_interval = Duration::from_secs(5);
         mock_generator
             .expect_next_payment_wait()
-            .returning(move || Ok(payment_interval));
+            .returning(move |_| Ok(payment_interval));
 
         assert_eq!(
-            get_payment_delay(0, &node, &mock_generator).unwrap(),
+            get_payment_delay(0, &node, &mock_generator, MutRng::new(None, 0)).unwrap(),
             start_delay
         );
         assert_eq!(
-            get_payment_delay(1, &node, &mock_generator).unwrap(),
+            get_payment_delay(1, &node, &mock_generator, MutRng::new(None, 0)).unwrap(),
             payment_interval
         );
     }
