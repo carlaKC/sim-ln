@@ -1,7 +1,14 @@
+use self::batched_writer::BatchedWriter;
+use self::clock::{Clock, SystemClock};
+use self::defined_activity::DefinedPaymentActivity;
+use self::random_activity::{NetworkGraphView, RandomPaymentActivity};
+use self::sim_node::{
+    ln_node_from_graph, populate_network_graph, ChannelPolicy, Interceptor, SimGraph,
+    SimulatedChannel,
+};
 use async_trait::async_trait;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::Network;
-use csv::WriterBuilder;
 use lightning::ln::features::NodeFeatures;
 use lightning::ln::PaymentHash;
 use rand::rngs::StdRng;
@@ -13,9 +20,8 @@ use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::marker::Send;
 use std::path::PathBuf;
-use std::sync::Mutex as StdMutex;
-use std::time::{SystemTimeError, UNIX_EPOCH};
-use std::{collections::HashMap, sync::Arc, time::SystemTime};
+use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
+use std::{collections::HashMap, sync::Arc};
 use thiserror::Error;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Mutex;
@@ -23,11 +29,11 @@ use tokio::task::JoinSet;
 use tokio::{select, time, time::Duration};
 use triggered::{Listener, Trigger};
 
-use self::defined_activity::DefinedPaymentActivity;
-use self::random_activity::{NetworkGraphView, RandomPaymentActivity};
-
+mod batched_writer;
 pub mod cln;
+pub mod clock;
 mod defined_activity;
+pub mod interceptors;
 pub mod lnd;
 mod random_activity;
 mod serializers;
@@ -96,7 +102,7 @@ impl std::fmt::Display for NodeId {
 }
 
 /// Represents a short channel ID, expressed as a struct so that we can implement display for the trait.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, Serialize, Deserialize)]
 pub struct ShortChannelID(u64);
 
 /// Utility function to easily convert from u64 to `ShortChannelID`
@@ -126,9 +132,13 @@ impl std::fmt::Display for ShortChannelID {
     }
 }
 
+/// Parameters for the simulation provided in our simulation file. Serde default
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SimParams {
+    #[serde(default)]
     pub nodes: Vec<NodeConnection>,
+    #[serde(default)]
+    pub sim_network: Vec<NetworkParser>,
     #[serde(default)]
     pub activity: Vec<ActivityParser>,
 }
@@ -173,6 +183,18 @@ where
 type Amount = ValueOrRange<u64>;
 /// The interval of seconds between payments. Either a value or a range.
 type Interval = ValueOrRange<u16>;
+
+/// Data structure that is used to parse information from the simulation file, used to pair two node policies together
+/// without the other internal state that is used in our simulated network.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkParser {
+    pub scid: ShortChannelID,
+    pub capacity_msat: u64,
+    pub node_1: ChannelPolicy,
+    pub node_2: ChannelPolicy,
+    #[serde(default)]
+    pub forward_only: bool,
+}
 
 /// Data structure used to parse information from the simulation file. It allows source and destination to be
 /// [NodeId], which enables the use of public keys and aliases in the simulation description.
@@ -239,6 +261,10 @@ pub enum SimulationError {
     PaymentGenerationError(PaymentGenerationError),
     #[error("Destination Generation Error: {0}")]
     DestinationGenerationError(DestinationGenerationError),
+    #[error("Simulated Time Error: {0}")]
+    SimulatedTimeError(String),
+    #[error("Fixed Seed Error: {0}")]
+    FixedSeedError(String),
 }
 
 #[derive(Debug, Error)]
@@ -263,7 +289,7 @@ pub enum LightningError {
     ListChannelsError(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NodeInfo {
     pub pubkey: PublicKey,
     pub alias: String,
@@ -317,6 +343,7 @@ pub trait DestinationGenerator: Send {
     /// capacity (if available).
     fn choose_destination(
         &self,
+        rng: &mut RngSend,
         source: PublicKey,
     ) -> Result<(NodeInfo, Option<u64>), DestinationGenerationError>;
 }
@@ -333,11 +360,15 @@ pub trait PaymentGenerator: Display + Send {
     fn payment_count(&self) -> Option<u64>;
 
     /// Returns the number of seconds that a node should wait until firing its next payment.
-    fn next_payment_wait(&self) -> Result<time::Duration, PaymentGenerationError>;
+    fn next_payment_wait(
+        &self,
+        rng: &mut RngSend,
+    ) -> Result<time::Duration, PaymentGenerationError>;
 
     /// Returns a payment amount based, with a destination capacity optionally provided to inform the amount picked.
     fn payment_amount(
         &self,
+        rng: &mut RngSend,
         destination_capacity: Option<u64>,
     ) -> Result<u64, PaymentGenerationError>;
 }
@@ -446,30 +477,23 @@ enum SimulationOutput {
     SendPaymentFailure(Payment, PaymentResult),
 }
 
-/// MutRngType is a convenient type alias for any random number generator (RNG) type that
-/// allows shared and exclusive access. This is necessary because a single RNG
-/// is to be shared across multiple `DestinationGenerator`s and `PaymentGenerator`s
-/// for deterministic outcomes.
-///
-/// **Note**: `StdMutex`, i.e. (`std::sync::Mutex`), is used here to avoid making the traits
-/// `DestinationGenerator` and `PaymentGenerator` async.
-type MutRngType = Arc<StdMutex<dyn RngCore + Send>>;
+/// RngSendType is a convenient type alias for any random number generator (RNG) type that is also Send.
+type RngSendType = Box<dyn RngCore + Send>;
 
-/// Newtype for `MutRngType` to encapsulate and hide implementation details for
-/// creating new `MutRngType` types. Provides convenient API for the same purpose.
-#[derive(Clone)]
-struct MutRng(MutRngType);
+/// Newtype for `RngSendType` to encapsulate and hide implementation details for creating new `RngSendType` types.
+/// Provides convenient API for the same purpose.
+pub struct RngSend(RngSendType);
 
-impl MutRng {
-    /// Creates a new MutRng given an optional `u64` argument. If `seed_opt` is `Some`,
-    /// random activity generation in the simulator occurs near-deterministically.
-    /// If it is `None`, activity generation is truly random, and based on a
-    /// non-deterministic source of entropy.
-    pub fn new(seed_opt: Option<u64>) -> Self {
+impl RngSend {
+    /// Creates a new RngSend given an optional `u64` argument. If `seed_opt` is `Some`, random activity generation
+    /// in the simulator occurs near-deterministically. If it is `None`, activity generation is truly random, and
+    /// based on a non-deterministic source of entropy. We also pass in "salt" for each RngSend that is created so
+    /// that individual callers with the same seed can still produce unique RNGs.
+    pub fn new(seed_opt: Option<u64>, salt: u64) -> Self {
         if let Some(seed) = seed_opt {
-            Self(Arc::new(StdMutex::new(ChaCha8Rng::seed_from_u64(seed))))
+            RngSend(Box::new(ChaCha8Rng::seed_from_u64(seed + salt)))
         } else {
-            Self(Arc::new(StdMutex::new(StdRng::from_entropy())))
+            RngSend(Box::new(StdRng::from_entropy()))
         }
     }
 }
@@ -486,10 +510,10 @@ pub struct SimulationCfg {
     activity_multiplier: f64,
     /// Configurations for printing results to CSV. Results are not written if this option is None.
     write_results: Option<WriteResults>,
-    /// Random number generator created from fixed seed.
-    seeded_rng: MutRng,
     /// Results logger that holds the simulation statistics.
     results: Arc<Mutex<PaymentResultLogger>>,
+    /// Optional seed to make random activity generation deterministic.
+    seed: Option<u64>,
 }
 
 impl SimulationCfg {
@@ -505,8 +529,8 @@ impl SimulationCfg {
             expected_payment_msat,
             activity_multiplier,
             write_results,
-            seeded_rng: MutRng::new(seed),
             results: Arc::new(Mutex::new(PaymentResultLogger::new())),
+            seed,
         }
     }
 }
@@ -522,6 +546,8 @@ pub struct Simulation {
     /// High level triggers used to manage simulation tasks and shutdown.
     shutdown_trigger: Trigger,
     shutdown_listener: Listener,
+    /// Clock for the simulation.
+    clock: Arc<dyn Clock>,
 }
 
 #[derive(Clone)]
@@ -555,7 +581,56 @@ impl Simulation {
             activity,
             shutdown_trigger,
             shutdown_listener,
+            clock: Arc::new(SystemClock {}),
         }
+    }
+
+    /// Creates a payment simulation that's running on a simulated set of channels. As this simulation has no
+    /// underlying nodes it can optionally be sped up by some multiplying factor.
+    pub async fn new_with_sim_network(
+        cfg: SimulationCfg,
+        channels: Vec<SimulatedChannel>,
+        activity: Vec<ActivityDefinition>,
+        clock: Arc<dyn Clock>,
+        interceptors: Vec<Arc<dyn Interceptor>>,
+        shutdown_listener: Listener,
+        shutdown_trigger: Trigger,
+    ) -> Result<(Self, Arc<Mutex<SimGraph>>), SimulationError> {
+
+        // Setup a simulation graph that will handle propagation of payments through the network.
+        let simulation_graph = Arc::new(Mutex::new(
+            SimGraph::new(
+                channels.clone(),
+                clock.clone(),
+                cfg.write_results.clone(),
+                interceptors,
+                shutdown_listener.clone(),
+                shutdown_trigger.clone(),
+            )
+            .map_err(|e| SimulationError::SimulatedNetworkError(format!("{:?}", e)))?,
+        ));
+
+        // Copy all of our simulated channels into a read-only routing graph, allowing us to pathfind for individual
+        // payments without locking the simulation graph (this is a duplication of our channels, but the performance
+        // tradeoff is worthwhile for concurrent pathfinding).
+        let routing_graph = Arc::new(
+            populate_network_graph(channels, clock.clone())
+                .map_err(|e| SimulationError::SimulatedNetworkError(format!("{:?}", e)))?,
+        );
+
+        let nodes = ln_node_from_graph(simulation_graph.clone(), routing_graph).await;
+
+        Ok((
+            Self {
+                nodes, // Here we should filter nodes out!
+                activity,
+                shutdown_trigger,
+                shutdown_listener,
+                cfg,
+                clock,
+            },
+            simulation_graph,
+        ))
     }
 
     /// validate_activity validates that the user-provided activity description is achievable for the network that
@@ -727,16 +802,24 @@ impl Simulation {
 
         // Start a task that will shutdown the simulation if the total_time is met.
         if let Some(total_time) = self.cfg.total_time {
-            let t = self.shutdown_trigger.clone();
-            let l = self.shutdown_listener.clone();
+            let shutdown = self.shutdown_trigger.clone();
+            let listener = self.shutdown_listener.clone();
+            let clock = self.clock.clone();
 
             tasks.spawn(async move {
-                if time::timeout(total_time, l).await.is_err() {
-                    log::info!(
-                        "Simulation run for {}s. Shutting down.",
-                        total_time.as_secs()
-                    );
-                    t.trigger()
+                select! {
+                    biased;
+                    _ = listener.clone() => {
+                        log::debug!("Timeout task exited on listener signal");
+                    }
+
+                    _ = clock.sleep(total_time) => {
+                        log::info!(
+                            "Simulation run for {}s. Shutting down.",
+                            total_time.as_secs()
+                        );
+                        shutdown.trigger()
+                    }
                 }
             });
         }
@@ -802,12 +885,14 @@ impl Simulation {
 
         let result_logger_clone = result_logger.clone();
         let result_logger_listener = listener.clone();
+        let clock = self.clock.clone();
         tasks.spawn(async move {
             log::debug!("Starting results logger.");
             run_results_logger(
                 result_logger_listener,
                 result_logger_clone,
                 Duration::from_secs(60),
+                clock,
             )
             .await;
             log::debug!("Exiting results logger.");
@@ -815,10 +900,12 @@ impl Simulation {
 
         // csr: consume simulation results
         let csr_write_results = self.cfg.write_results.clone();
+        let clock = self.clock.clone();
         tasks.spawn(async move {
             log::debug!("Starting simulation results consumer.");
             if let Err(e) = consume_simulation_results(
                 result_logger,
+                clock,
                 results_receiver,
                 listener,
                 csr_write_results,
@@ -897,11 +984,8 @@ impl Simulation {
         }
 
         let network_generator = Arc::new(Mutex::new(
-            NetworkGraphView::new(
-                active_nodes.values().cloned().collect(),
-                self.cfg.seeded_rng.clone(),
-            )
-            .map_err(SimulationError::RandomActivityError)?,
+            NetworkGraphView::new(active_nodes.values().cloned().collect())
+                .map_err(SimulationError::RandomActivityError)?,
         ));
 
         log::info!(
@@ -918,7 +1002,6 @@ impl Simulation {
                         *capacity,
                         self.cfg.expected_payment_msat,
                         self.cfg.activity_multiplier,
-                        self.cfg.seeded_rng.clone(),
                     )
                     .map_err(SimulationError::RandomActivityError)?,
                 ),
@@ -956,11 +1039,12 @@ impl Simulation {
             let ce_shutdown = self.shutdown_trigger.clone();
             let ce_output_sender = output_sender.clone();
             let ce_node = node.clone();
+            let clock = self.clock.clone();
             tasks.spawn(async move {
                 let node_info = ce_node.lock().await.get_info().clone();
                 log::debug!("Starting events consumer for {}.", node_info);
                 if let Err(e) =
-                    consume_events(ce_node, receiver, ce_output_sender, ce_listener).await
+                    consume_events(ce_node, clock, receiver, ce_output_sender, ce_listener).await
                 {
                     ce_shutdown.trigger();
                     log::error!("Event consumer for node {node_info} exited with error: {e:?}.");
@@ -993,6 +1077,9 @@ impl Simulation {
             let pe_shutdown = self.shutdown_trigger.clone();
             let pe_listener = self.shutdown_listener.clone();
             let pe_sender = sender.clone();
+            let clock = self.clock.clone();
+            let pe_seed = self.cfg.seed;
+
             tasks.spawn(async move {
                 let source = executor.source_info.clone();
 
@@ -1006,7 +1093,9 @@ impl Simulation {
                     executor.source_info,
                     executor.network_generator,
                     executor.payment_generator,
+                    clock,
                     pe_sender,
+                    pe_seed,
                     pe_listener,
                 )
                 .await
@@ -1027,6 +1116,7 @@ impl Simulation {
 /// event being executed is piped into a channel to handle the result of the event.
 async fn consume_events(
     node: Arc<Mutex<dyn LightningNode>>,
+    clock: Arc<dyn Clock>,
     mut receiver: Receiver<SimulationEvent>,
     sender: Sender<SimulationOutput>,
     listener: Listener,
@@ -1048,7 +1138,7 @@ async fn consume_events(
                                 hash: None,
                                 amount_msat: amt_msat,
                                 destination: dest.pubkey,
-                                dispatch_time: SystemTime::now(),
+                                dispatch_time: clock.now(),
                             };
 
                             let outcome = match node.send_payment(dest.pubkey, amt_msat).await {
@@ -1110,9 +1200,24 @@ async fn produce_events<N: DestinationGenerator + ?Sized, A: PaymentGenerator + 
     source: NodeInfo,
     network_generator: Arc<Mutex<N>>,
     node_generator: Box<A>,
+    clock: Arc<dyn Clock>,
     sender: Sender<SimulationEvent>,
+    seed: Option<u64>,
     listener: Listener,
 ) -> Result<(), SimulationError> {
+    // Pubkey is only exposed via to_string API, so we grab the last 15 digits to get an identifier for this
+    // node to feed into our RNG creation below.
+    let pk_str = source.pubkey.to_string();
+    let pk = u64::from_str_radix(&pk_str[pk_str.len() - 15..], 16)
+        .map_err(|e| SimulationError::FixedSeedError(e.to_string()))?;
+
+    // We create one RNG per payment activity generator so that when we have a fixed seed, each generator will get the
+    // same set of values across runs (with a shared RNG, the order in which tasks access the shared RNG would change
+    // the value that each generator gets). We "salt" the set seed with a value based on the node's public key so that
+    // each generator will start with a different seed, but it will be the same across runs. It is not critical is the
+    // value is the same for two nodes (and it's very unlikely). We can't use an index here because order of iteration
+    // through hashmaps is random.
+    let mut rng = RngSend::new(seed, pk);
     let mut current_count = 0;
     loop {
         if let Some(c) = node_generator.payment_count() {
@@ -1124,7 +1229,7 @@ async fn produce_events<N: DestinationGenerator + ?Sized, A: PaymentGenerator + 
             }
         }
 
-        let wait = get_payment_delay(current_count, &source, node_generator.as_ref())?;
+        let wait = get_payment_delay(current_count, &source, node_generator.as_ref(), &mut rng)?;
 
         select! {
             biased;
@@ -1133,13 +1238,14 @@ async fn produce_events<N: DestinationGenerator + ?Sized, A: PaymentGenerator + 
             },
             // Wait until our time to next payment has elapsed then execute a random amount payment to a random
             // destination.
-            _ = time::sleep(wait) => {
-                let (destination, capacity) = network_generator.lock().await.choose_destination(source.pubkey).map_err(SimulationError::DestinationGenerationError)?;
+            _ = clock.sleep(wait) => {
+                let (destination, capacity) = network_generator.lock().await.
+                    choose_destination(&mut rng, source.pubkey).map_err(SimulationError::DestinationGenerationError)?;
 
                 // Only proceed with a payment if the amount is non-zero, otherwise skip this round. If we can't get
                 // a payment amount something has gone wrong (because we should have validated that we can always
                 // generate amounts), so we exit.
-                let amount = match node_generator.payment_amount(capacity) {
+                let amount = match node_generator.payment_amount(&mut rng,capacity) {
                     Ok(amt) => {
                         if amt == 0 {
                             log::debug!("Skipping zero amount payment for {source} -> {destination}.");
@@ -1181,6 +1287,7 @@ fn get_payment_delay<A: PaymentGenerator + ?Sized>(
     call_count: u64,
     source: &NodeInfo,
     node_generator: &A,
+    rng: &mut RngSend,
 ) -> Result<Duration, SimulationError> {
     // Note: we can't check if let Some() && call_count (syntax not allowed) so we add an additional branch in here.
     // The alternative is to call payment_start twice (which is _technically_ fine because it always returns the same
@@ -1188,7 +1295,7 @@ fn get_payment_delay<A: PaymentGenerator + ?Sized>(
     // don't have to make any assumptions about the underlying operation of payment_start.
     if call_count != 0 {
         let wait = node_generator
-            .next_payment_wait()
+            .next_payment_wait(rng)
             .map_err(SimulationError::PaymentGenerationError)?;
         log::debug!("Next payment for {source} in {:?}.", wait);
         Ok(wait)
@@ -1200,7 +1307,7 @@ fn get_payment_delay<A: PaymentGenerator + ?Sized>(
         Ok(start)
     } else {
         let wait = node_generator
-            .next_payment_wait()
+            .next_payment_wait(rng)
             .map_err(SimulationError::PaymentGenerationError)?;
         log::debug!("First payment for {source} in {:?}.", wait);
         Ok(wait)
@@ -1209,32 +1316,30 @@ fn get_payment_delay<A: PaymentGenerator + ?Sized>(
 
 async fn consume_simulation_results(
     logger: Arc<Mutex<PaymentResultLogger>>,
+    clock: Arc<dyn Clock>,
     mut receiver: Receiver<(Payment, PaymentResult)>,
     listener: Listener,
     write_results: Option<WriteResults>,
 ) -> Result<(), SimulationError> {
-    let mut writer = match write_results {
-        Some(res) => {
-            let duration = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?;
-            let file = res
-                .results_dir
-                .join(format!("simulation_{:?}.csv", duration));
-            let writer = WriterBuilder::new().from_path(file)?;
-            Some((writer, res.batch_size))
-        },
-        None => None,
-    };
+    let mut writer = None;
+    if let Some(w) = write_results {
+        // File name contains time that simulation was started.
+        let file_name = format!(
+            "simulation_{:?}.csv",
+            clock
+                .now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_secs()
+        );
 
-    let mut counter = 1;
+        writer = Some(BatchedWriter::new(w.results_dir, file_name, w.batch_size)?);
+    }
 
     loop {
         select! {
             biased;
             _ = listener.clone() => {
-                writer.map_or(Ok(()), |(ref mut w, _)| w.flush().map_err(|_| {
-                    SimulationError::FileError
-                }))?;
-                return Ok(());
+                return writer.map_or(Ok(()), |mut w| w.write(true));
             },
             payment_result = receiver.recv() => {
                 match payment_result {
@@ -1242,20 +1347,11 @@ async fn consume_simulation_results(
                         logger.lock().await.report_result(&details, &result);
                         log::trace!("Resolved dispatched payment: {} with: {}.", details, result);
 
-                        if let Some((ref mut w, batch_size)) = writer {
-                            w.serialize((details, result)).map_err(|e| {
-                                let _ = w.flush();
-                                SimulationError::CsvError(e)
-                            })?;
-                            counter = counter % batch_size + 1;
-                            if batch_size == counter {
-                                w.flush().map_err(|_| {
-                                    SimulationError::FileError
-                                })?;
-                            }
+                        if let Some(ref mut w) = writer{
+                            w.queue((details, result))?;
                         }
                     },
-                    None => return writer.map_or(Ok(()), |(ref mut w, _)| w.flush().map_err(|_| SimulationError::FileError)),
+                    None => return writer.map_or(Ok(()), |mut w| w.write(true)),
                 }
             }
         }
@@ -1314,6 +1410,7 @@ async fn run_results_logger(
     listener: Listener,
     logger: Arc<Mutex<PaymentResultLogger>>,
     interval: Duration,
+    clock: Arc<dyn Clock>,
 ) {
     log::info!("Summary of results will be reported every {:?}.", interval);
 
@@ -1324,7 +1421,7 @@ async fn run_results_logger(
                 break
             }
 
-            _ = time::sleep(interval) => {
+            _ = clock.sleep(interval) => {
                 log::info!("{}", logger.lock().await)
             }
         }
@@ -1459,7 +1556,7 @@ async fn track_payment_result(
 
 #[cfg(test)]
 mod tests {
-    use crate::{get_payment_delay, test_utils, MutRng, PaymentGenerationError, PaymentGenerator};
+    use crate::{get_payment_delay, test_utils, PaymentGenerationError, PaymentGenerator, RngSend};
     use mockall::mock;
     use std::fmt;
     use std::time::Duration;
@@ -1469,23 +1566,31 @@ mod tests {
         let seeds = vec![u64::MIN, u64::MAX];
 
         for seed in seeds {
-            let mut_rng_1 = MutRng::new(Some(seed));
-            let mut_rng_2 = MutRng::new(Some(seed));
+            let mut_rng_1 = RngSend::new(Some(seed), 0);
+            let mut_rng_2 = RngSend::new(Some(seed), 0);
 
-            let mut rng_1 = mut_rng_1.0.lock().unwrap();
-            let mut rng_2 = mut_rng_2.0.lock().unwrap();
+            let mut rng_1 = mut_rng_1.0;
+            let mut rng_2 = mut_rng_2.0;
 
             assert_eq!(rng_1.next_u64(), rng_2.next_u64())
         }
     }
 
     #[test]
-    fn create_unseeded_mut_rng() {
-        let mut_rng_1 = MutRng::new(None);
-        let mut_rng_2 = MutRng::new(None);
+    fn create_salted_rng() {
+        let mut rng_1 = RngSend::new(Some(1234), 0);
+        let mut rng_2 = RngSend::new(Some(1234), 1);
 
-        let mut rng_1 = mut_rng_1.0.lock().unwrap();
-        let mut rng_2 = mut_rng_2.0.lock().unwrap();
+        assert!(rng_1.0.next_u64() != rng_2.0.next_u64())
+    }
+
+    #[test]
+    fn create_unseeded_mut_rng() {
+        let mut_rng_1 = RngSend::new(None, 0);
+        let mut_rng_2 = RngSend::new(None, 0);
+
+        let mut rng_1 = mut_rng_1.0;
+        let mut rng_2 = mut_rng_2.0;
 
         assert_ne!(rng_1.next_u64(), rng_2.next_u64())
     }
@@ -1500,8 +1605,8 @@ mod tests {
         impl PaymentGenerator for Generator {
             fn payment_start(&self) -> Option<Duration>;
             fn payment_count(&self) -> Option<u64>;
-            fn next_payment_wait(&self) -> Result<Duration, PaymentGenerationError>;
-            fn payment_amount(&self, destination_capacity: Option<u64>) -> Result<u64, PaymentGenerationError>;
+            fn next_payment_wait(&self, rng: &mut RngSend) -> Result<Duration, PaymentGenerationError>;
+            fn payment_amount(&self,rng: &mut RngSend, destination_capacity: Option<u64>) -> Result<u64, PaymentGenerationError>;
         }
     }
 
@@ -1519,14 +1624,15 @@ mod tests {
         let payment_interval = Duration::from_secs(5);
         mock_generator
             .expect_next_payment_wait()
-            .returning(move || Ok(payment_interval));
+            .returning(move |_| Ok(payment_interval));
 
+        let mut rng = RngSend::new(None, 0);
         assert_eq!(
-            get_payment_delay(0, &node, &mock_generator).unwrap(),
+            get_payment_delay(0, &node, &mock_generator, &mut rng).unwrap(),
             payment_interval
         );
         assert_eq!(
-            get_payment_delay(1, &node, &mock_generator).unwrap(),
+            get_payment_delay(1, &node, &mock_generator, &mut rng).unwrap(),
             payment_interval
         );
     }
@@ -1548,14 +1654,15 @@ mod tests {
         let payment_interval = Duration::from_secs(5);
         mock_generator
             .expect_next_payment_wait()
-            .returning(move || Ok(payment_interval));
+            .returning(move |_| Ok(payment_interval));
 
+        let mut rng = RngSend::new(None, 0);
         assert_eq!(
-            get_payment_delay(0, &node, &mock_generator).unwrap(),
+            get_payment_delay(0, &node, &mock_generator, &mut rng).unwrap(),
             start_delay
         );
         assert_eq!(
-            get_payment_delay(1, &node, &mock_generator).unwrap(),
+            get_payment_delay(1, &node, &mock_generator, &mut rng).unwrap(),
             payment_interval
         );
     }
