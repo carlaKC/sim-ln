@@ -1094,6 +1094,7 @@ async fn remove_htlcs(
 /// Finds a payment path from the source to destination nodes provided, and propagates the appropriate htlcs through
 /// the simulated network, notifying the sender channel provided of the payment outcome. If a critical error occurs,
 /// ie a breakdown of our state machine, it will still notify the payment outcome and will use the shutdown trigger
+#[allow(clippy::too_many_arguments)]
 async fn propagate_payment(
     nodes: Arc<Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
     source: PublicKey,
