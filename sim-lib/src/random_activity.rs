@@ -1,4 +1,5 @@
 use core::fmt;
+use std::borrow::BorrowMut;
 use std::fmt::Display;
 use thiserror::Error;
 
@@ -66,19 +67,15 @@ impl DestinationGenerator for NetworkGraphView {
     /// very small graphs, or those with one node significantly more capitalized than others).
     fn choose_destination(
         &self,
-        rng: MutRng,
+        rng: &mut MutRng,
         source: PublicKey,
     ) -> Result<(NodeInfo, Option<u64>), DestinationGenerationError> {
-        let mut rng = rng
-            .0
-            .lock()
-            .map_err(|e| DestinationGenerationError(e.to_string()))?;
         // While it's very unlikely that we can't pick a destination that is not our source, it's possible that there's
         // a bug in our selection, so we track attempts to select a non-source node so that we can warn if this takes
         // improbably long.
         let mut i = 1;
         loop {
-            let index = self.node_picker.sample(&mut *rng);
+            let index = self.node_picker.sample(&mut rng.0);
             // Unwrapping is safe given `NetworkGraphView` has the same amount of elements for `nodes` and `node_picker`
             let (node_info, capacity) = self.nodes.get(index).unwrap();
 
@@ -216,12 +213,9 @@ impl PaymentGenerator for RandomPaymentActivity {
     }
 
     /// Returns the amount of time until the next payment should be scheduled for the node.
-    fn next_payment_wait(&self, rng: MutRng) -> Result<Duration, PaymentGenerationError> {
-        let mut rng = rng
-            .0
-            .lock()
-            .map_err(|e| PaymentGenerationError(e.to_string()))?;
-        let duration_in_secs = self.event_dist.sample(&mut *rng) as u64;
+    fn next_payment_wait(&self, rng: &mut MutRng) -> Result<Duration, PaymentGenerationError> {
+        let rng = rng.borrow_mut();
+        let duration_in_secs = self.event_dist.sample(&mut rng.0) as u64;
 
         Ok(Duration::from_secs(duration_in_secs))
     }
@@ -235,7 +229,7 @@ impl PaymentGenerator for RandomPaymentActivity {
     /// channel capacity.
     fn payment_amount(
         &self,
-        rng: MutRng,
+        rng: &mut MutRng,
         destination_capacity: Option<u64>,
     ) -> Result<u64, PaymentGenerationError> {
         let destination_capacity = destination_capacity.ok_or(PaymentGenerationError(
@@ -259,11 +253,7 @@ impl PaymentGenerator for RandomPaymentActivity {
         let log_normal = LogNormal::new(mu, sigma_square.sqrt())
             .map_err(|e| PaymentGenerationError(e.to_string()))?;
 
-        let mut rng = rng
-            .0
-            .lock()
-            .map_err(|e| PaymentGenerationError(e.to_string()))?;
-        let payment_amount = log_normal.sample(&mut *rng) as u64;
+        let payment_amount = log_normal.sample(&mut rng.0) as u64;
 
         Ok(payment_amount)
     }
@@ -355,7 +345,7 @@ mod tests {
             let view = NetworkGraphView::new(nodes).unwrap();
 
             for _ in 0..10 {
-                view.choose_destination(MutRng::new(None, 0), big_node)
+                view.choose_destination(&mut MutRng::new(None, 0), big_node)
                     .unwrap();
             }
         }
@@ -423,29 +413,29 @@ mod tests {
             // All of them will yield a sigma squared smaller than 0, which we have a sanity check for.
             let expected_payment = get_random_int(1, 100);
             let source_capacity = 2 * expected_payment;
-            let rng = MutRng::new(Some(u64::MAX), 0);
+            let mut rng = MutRng::new(Some(u64::MAX), 0);
             let pag = RandomPaymentActivity::new(source_capacity, expected_payment, 1.0).unwrap();
 
             // Wrong cases
             for i in 0..source_capacity {
                 assert!(matches!(
-                    pag.payment_amount(rng.clone(), Some(i)),
+                    pag.payment_amount(&mut rng, Some(i)),
                     Err(PaymentGenerationError(..))
                 ))
             }
 
             // All other cases will work. We are not going to exhaustively test for the rest up to u64::MAX, let just pick a bunch
             for i in source_capacity + 1..100 * source_capacity {
-                assert!(pag.payment_amount(rng.clone(), Some(i)).is_ok())
+                assert!(pag.payment_amount(&mut rng, Some(i)).is_ok())
             }
 
             // We can even try really high numbers to make sure they are not troublesome
             for i in u64::MAX - 10000..u64::MAX {
-                assert!(pag.payment_amount(rng.clone(), Some(i)).is_ok())
+                assert!(pag.payment_amount(&mut rng, Some(i)).is_ok())
             }
 
             assert!(matches!(
-                pag.payment_amount(rng.clone(), None),
+                pag.payment_amount(&mut rng, None),
                 Err(PaymentGenerationError(..))
             ));
         }

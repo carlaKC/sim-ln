@@ -45,7 +45,7 @@ impl fmt::Display for DefinedPaymentActivity {
 impl DestinationGenerator for DefinedPaymentActivity {
     fn choose_destination(
         &self,
-        _: MutRng,
+        _: &mut MutRng,
         _: bitcoin::secp256k1::PublicKey,
     ) -> Result<(NodeInfo, Option<u64>), DestinationGenerationError> {
         Ok((self.destination.clone(), None))
@@ -61,13 +61,13 @@ impl PaymentGenerator for DefinedPaymentActivity {
         self.count
     }
 
-    fn next_payment_wait(&self, _: MutRng) -> Result<Duration, PaymentGenerationError> {
+    fn next_payment_wait(&self, _: &mut MutRng) -> Result<Duration, PaymentGenerationError> {
         Ok(Duration::from_secs(self.wait.value() as u64))
     }
 
     fn payment_amount(
         &self,
-        _: MutRng,
+        _: &mut MutRng,
         destination_capacity: Option<u64>,
     ) -> Result<u64, crate::PaymentGenerationError> {
         if destination_capacity.is_some() {
@@ -102,20 +102,17 @@ mod tests {
             crate::ValueOrRange::Value(payment_amt),
         );
 
-        let (dest, dest_capacity) = generator
-            .choose_destination(MutRng::new(None, 0), source.1)
-            .unwrap();
+        let mut rng = MutRng::new(None, 0);
+        let (dest, dest_capacity) = generator.choose_destination(&mut rng, source.1).unwrap();
         assert_eq!(node.pubkey, dest.pubkey);
         assert!(dest_capacity.is_none());
 
         assert_eq!(
             payment_amt,
-            generator
-                .payment_amount(MutRng::new(None, 0), None)
-                .unwrap()
+            generator.payment_amount(&mut rng, None).unwrap()
         );
         assert!(matches!(
-            generator.payment_amount(MutRng::new(None, 0), Some(10)),
+            generator.payment_amount(&mut rng, Some(10)),
             Err(PaymentGenerationError(..))
         ));
     }

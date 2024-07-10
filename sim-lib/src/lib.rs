@@ -13,7 +13,6 @@ use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::marker::Send;
 use std::path::PathBuf;
-use std::sync::Mutex as StdMutex;
 use std::time::{SystemTimeError, UNIX_EPOCH};
 use std::{collections::HashMap, sync::Arc, time::SystemTime};
 use thiserror::Error;
@@ -319,7 +318,7 @@ pub trait DestinationGenerator: Send {
     /// capacity (if available).
     fn choose_destination(
         &self,
-        rng: MutRng,
+        rng: &mut MutRng,
         source: PublicKey,
     ) -> Result<(NodeInfo, Option<u64>), DestinationGenerationError>;
 }
@@ -336,12 +335,13 @@ pub trait PaymentGenerator: Display + Send {
     fn payment_count(&self) -> Option<u64>;
 
     /// Returns the number of seconds that a node should wait until firing its next payment.
-    fn next_payment_wait(&self, rng: MutRng) -> Result<time::Duration, PaymentGenerationError>;
+    fn next_payment_wait(&self, rng: &mut MutRng)
+        -> Result<time::Duration, PaymentGenerationError>;
 
     /// Returns a payment amount based, with a destination capacity optionally provided to inform the amount picked.
     fn payment_amount(
         &self,
-        rng: MutRng,
+        rng: &mut MutRng,
         destination_capacity: Option<u64>,
     ) -> Result<u64, PaymentGenerationError>;
 }
@@ -457,11 +457,10 @@ enum SimulationOutput {
 ///
 /// **Note**: `StdMutex`, i.e. (`std::sync::Mutex`), is used here to avoid making the traits
 /// `DestinationGenerator` and `PaymentGenerator` async.
-type MutRngType = Arc<StdMutex<Box<dyn RngCore + Send>>>;
+type MutRngType = Box<dyn RngCore + Send>;
 
 /// Newtype for `MutRngType` to encapsulate and hide implementation details for
 /// creating new `MutRngType` types. Provides convenient API for the same purpose.
-#[derive(Clone)]
 pub struct MutRng(pub MutRngType);
 
 impl MutRng {
@@ -471,11 +470,9 @@ impl MutRng {
     /// non-deterministic source of entropy.
     pub fn new(seed_opt: Option<u64>, salt: u64) -> Self {
         if let Some(seed) = seed_opt {
-            Self(Arc::new(StdMutex::new(
-                Box::new(ChaCha8Rng::seed_from_u64(seed + salt)) as Box<dyn RngCore + Send>,
-            )))
+            MutRng(Box::new(ChaCha8Rng::seed_from_u64(seed + salt)))
         } else {
-            Self(Arc::new(StdMutex::new(Box::new(StdRng::from_entropy()))))
+            MutRng(Box::new(StdRng::from_entropy()))
         }
     }
 }
@@ -1128,9 +1125,9 @@ async fn produce_events<N: DestinationGenerator + ?Sized, A: PaymentGenerator + 
         // start with a different seed, but it will be the same across runs. It is not critical is the
         // value is the same for two nodes (and it's very unlikely). We can't use an index here
         // because order of iteration through hashmaps is random.
-        let rng = MutRng::new(seed, pk);
+        let mut rng = MutRng::new(seed, pk);
 
-        let wait = get_payment_delay(current_count, &source, node_generator.as_ref(), rng.clone())?;
+        let wait = get_payment_delay(current_count, &source, node_generator.as_ref(), &mut rng)?;
 
         select! {
             biased;
@@ -1140,12 +1137,13 @@ async fn produce_events<N: DestinationGenerator + ?Sized, A: PaymentGenerator + 
             // Wait until our time to next payment has elapsed then execute a random amount payment to a random
             // destination.
             _ = time::sleep(wait) => {
-                let (destination, capacity) = network_generator.lock().await.choose_destination(rng.clone(), source.pubkey).map_err(SimulationError::DestinationGenerationError)?;
+                let (destination, capacity) = network_generator.lock().await.
+                    choose_destination(&mut rng, source.pubkey).map_err(SimulationError::DestinationGenerationError)?;
 
                 // Only proceed with a payment if the amount is non-zero, otherwise skip this round. If we can't get
                 // a payment amount something has gone wrong (because we should have validated that we can always
                 // generate amounts), so we exit.
-                let amount = match node_generator.payment_amount(rng,capacity) {
+                let amount = match node_generator.payment_amount(&mut rng,capacity) {
                     Ok(amt) => {
                         if amt == 0 {
                             log::debug!("Skipping zero amount payment for {source} -> {destination}.");
@@ -1178,7 +1176,7 @@ fn get_payment_delay<A: PaymentGenerator + ?Sized>(
     call_count: u64,
     source: &NodeInfo,
     node_generator: &A,
-    rng: MutRng,
+    rng: &mut MutRng,
 ) -> Result<Duration, SimulationError> {
     // Note: we can't check if let Some() && call_count (syntax not allowed) so we add an additional branch in here.
     // The alternative is to call payment_start twice (which is _technically_ fine because it always returns the same
@@ -1454,8 +1452,8 @@ mod tests {
             let mut_rng_1 = MutRng::new(Some(seed), 0);
             let mut_rng_2 = MutRng::new(Some(seed), 0);
 
-            let mut rng_1 = mut_rng_1.0.lock().unwrap();
-            let mut rng_2 = mut_rng_2.0.lock().unwrap();
+            let mut rng_1 = mut_rng_1.0;
+            let mut rng_2 = mut_rng_2.0;
 
             assert_eq!(rng_1.next_u64(), rng_2.next_u64())
         }
@@ -1466,8 +1464,8 @@ mod tests {
         let mut_rng_1 = MutRng::new(None, 0);
         let mut_rng_2 = MutRng::new(None, 0);
 
-        let mut rng_1 = mut_rng_1.0.lock().unwrap();
-        let mut rng_2 = mut_rng_2.0.lock().unwrap();
+        let mut rng_1 = mut_rng_1.0;
+        let mut rng_2 = mut_rng_2.0;
 
         assert_ne!(rng_1.next_u64(), rng_2.next_u64())
     }
@@ -1482,8 +1480,8 @@ mod tests {
         impl PaymentGenerator for Generator {
             fn payment_start(&self) -> Option<Duration>;
             fn payment_count(&self) -> Option<u64>;
-            fn next_payment_wait(&self, rng: MutRng) -> Result<Duration, PaymentGenerationError>;
-            fn payment_amount(&self,rng: MutRng, destination_capacity: Option<u64>) -> Result<u64, PaymentGenerationError>;
+            fn next_payment_wait(&self, rng: &mut MutRng) -> Result<Duration, PaymentGenerationError>;
+            fn payment_amount(&self,rng: &mut MutRng, destination_capacity: Option<u64>) -> Result<u64, PaymentGenerationError>;
         }
     }
 
@@ -1503,12 +1501,13 @@ mod tests {
             .expect_next_payment_wait()
             .returning(move |_| Ok(payment_interval));
 
+        let mut rng = MutRng::new(None, 0);
         assert_eq!(
-            get_payment_delay(0, &node, &mock_generator, MutRng::new(None, 0)).unwrap(),
+            get_payment_delay(0, &node, &mock_generator, &mut rng).unwrap(),
             payment_interval
         );
         assert_eq!(
-            get_payment_delay(1, &node, &mock_generator, MutRng::new(None, 0)).unwrap(),
+            get_payment_delay(1, &node, &mock_generator, &mut rng).unwrap(),
             payment_interval
         );
     }
@@ -1532,12 +1531,13 @@ mod tests {
             .expect_next_payment_wait()
             .returning(move |_| Ok(payment_interval));
 
+        let mut rng = MutRng::new(None, 0);
         assert_eq!(
-            get_payment_delay(0, &node, &mock_generator, MutRng::new(None, 0)).unwrap(),
+            get_payment_delay(0, &node, &mock_generator, &mut rng).unwrap(),
             start_delay
         );
         assert_eq!(
-            get_payment_delay(1, &node, &mock_generator, MutRng::new(None, 0)).unwrap(),
+            get_payment_delay(1, &node, &mock_generator, &mut rng).unwrap(),
             payment_interval
         );
     }
