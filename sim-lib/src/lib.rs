@@ -239,6 +239,8 @@ pub enum SimulationError {
     PaymentGenerationError(PaymentGenerationError),
     #[error("Destination Generation Error: {0}")]
     DestinationGenerationError(DestinationGenerationError),
+    #[error("Fixed Seed Error: {0}")]
+    FixedSeedError(String),
 }
 
 #[derive(Debug, Error)]
@@ -465,10 +467,10 @@ impl MutRng {
     /// random activity generation in the simulator occurs near-deterministically.
     /// If it is `None`, activity generation is truly random, and based on a
     /// non-deterministic source of entropy.
-    pub fn new(seed_opt: Option<u64>) -> Self {
+    pub fn new(seed_opt: Option<u64>, salt: u64) -> Self {
         if let Some(seed) = seed_opt {
             Self(Arc::new(StdMutex::new(
-                Box::new(ChaCha8Rng::seed_from_u64(seed)) as Box<dyn RngCore + Send>,
+                Box::new(ChaCha8Rng::seed_from_u64(seed + salt)) as Box<dyn RngCore + Send>,
             )))
         } else {
             Self(Arc::new(StdMutex::new(Box::new(StdRng::from_entropy()))))
@@ -489,7 +491,7 @@ pub struct SimulationCfg {
     /// Configurations for printing results to CSV. Results are not written if this option is None.
     write_results: Option<WriteResults>,
     /// Random number generator created from fixed seed.
-    seeded_rng: MutRng,
+    seed: Option<u64>,
 }
 
 impl SimulationCfg {
@@ -505,7 +507,7 @@ impl SimulationCfg {
             expected_payment_msat,
             activity_multiplier,
             write_results,
-            seeded_rng: MutRng::new(seed),
+            seed,
         }
     }
 }
@@ -887,12 +889,15 @@ impl Simulation {
             active_nodes.insert(node_info.pubkey, (node_info, capacity));
         }
 
+        // Create a single RNG for the network graph generator using our seed (or a random one if not specified). The
+        // non-deterministic order in which different async tasks access a single RNG increases its variance (as
+        // different orders result in different values for each task), so we aim to use one RNG per process to decrease
+        // variance. The network generator is shared (because it holds the whole graph), so there will still be some
+        // non-deterministic behavior when we pick destinations.
+        let network_rng = MutRng::new(self.cfg.seed, 0);
         let network_generator = Arc::new(Mutex::new(
-            NetworkGraphView::new(
-                active_nodes.values().cloned().collect(),
-                self.cfg.seeded_rng.clone(),
-            )
-            .map_err(SimulationError::RandomActivityError)?,
+            NetworkGraphView::new(active_nodes.values().cloned().collect(), network_rng)
+                .map_err(SimulationError::RandomActivityError)?,
         ));
 
         log::info!(
@@ -901,6 +906,12 @@ impl Simulation {
         );
 
         for (node_info, capacity) in active_nodes.values() {
+            // Pubkey is only exposed via to_string API, so we grab the last 15 digits to get an identifier for this
+            // node to feed into our RNG creation below.
+            let pk_str = node_info.pubkey.to_string();
+            let pk = u64::from_str_radix(&pk_str[pk_str.len() - 15..], 16)
+                .map_err(|e| SimulationError::FixedSeedError(e.to_string()))?;
+
             generators.push(ExecutorKit {
                 source_info: node_info.clone(),
                 network_generator: network_generator.clone(),
@@ -909,7 +920,14 @@ impl Simulation {
                         *capacity,
                         self.cfg.expected_payment_msat,
                         self.cfg.activity_multiplier,
-                        self.cfg.seeded_rng.clone(),
+                        // We create one RNG per payment activity generator so that when we have a fixed seed, each
+                        // generator will get the same set of values across runs (with a shared RNG, the order in
+                        // which tasks access the shared RNG would change the value that each generator gets). We
+                        // "salt" the set seed with a value based on the node's public key so that each generator will
+                        // start with a different seed, but it will be the same across runs. It is not critical is the
+                        // value is the same for two nodes (and it's very unlikely). We can't use an index here
+                        // because order of iteration through hashmaps is random.
+                        MutRng::new(self.cfg.seed, pk),
                     )
                     .map_err(SimulationError::RandomActivityError)?,
                 ),
@@ -1426,8 +1444,8 @@ mod tests {
         let seeds = vec![u64::MIN, u64::MAX];
 
         for seed in seeds {
-            let mut_rng_1 = MutRng::new(Some(seed));
-            let mut_rng_2 = MutRng::new(Some(seed));
+            let mut_rng_1 = MutRng::new(Some(seed), 0);
+            let mut_rng_2 = MutRng::new(Some(seed), 0);
 
             let mut rng_1 = mut_rng_1.0.lock().unwrap();
             let mut rng_2 = mut_rng_2.0.lock().unwrap();
@@ -1438,8 +1456,8 @@ mod tests {
 
     #[test]
     fn create_unseeded_mut_rng() {
-        let mut_rng_1 = MutRng::new(None);
-        let mut_rng_2 = MutRng::new(None);
+        let mut_rng_1 = MutRng::new(None, 0);
+        let mut_rng_2 = MutRng::new(None, 0);
 
         let mut rng_1 = mut_rng_1.0.lock().unwrap();
         let mut rng_2 = mut_rng_2.0.lock().unwrap();
