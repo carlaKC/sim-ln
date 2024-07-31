@@ -1162,8 +1162,16 @@ async fn consume_events(
                                 }
                             };
 
-                            if sender.send(outcome.clone()).await.is_err() {
-                                return Err(SimulationError::MpscChannelError(format!("Error sending simulation output {outcome:?}.")));
+                            select!{
+                                biased;
+                                _ = listener.clone() => {
+                                    return Ok(())
+                                }
+                                send_result = sender.send(outcome.clone()) => {
+                                    if send_result.is_err() {
+                                        return Err(SimulationError::MpscChannelError(format!("Error sending simulation output {outcome:?}.")));
+                                    }
+                                }
                             }
                         }
                     }
