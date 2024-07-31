@@ -783,10 +783,16 @@ impl Simulation {
         // If all producers finish, then there is nothing left to do and the simulation can be shutdown.
         let producer_trigger = self.shutdown_trigger.clone();
         tasks.spawn(async move {
+            let mut producer_count = 0;
+            log::info!("Waiting for {} producers to finish", producer_tasks.len());
             while let Some(res) = producer_tasks.join_next().await {
+                log::info!("Waiting for {producer_count} producer to exit");
                 if let Err(e) = res {
                     log::error!("Producer exited with error: {e}.");
                 }
+
+                log::info!("Producer {producer_count} exit without an error");
+                producer_count += 1;
             }
             log::info!("All producers finished. Shutting down.");
             producer_trigger.trigger()
@@ -1238,8 +1244,16 @@ async fn produce_events<N: DestinationGenerator + ?Sized, A: PaymentGenerator + 
 
                 // Send the payment, exiting if we can no longer send to the consumer.
                 let event = SimulationEvent::SendPayment(destination.clone(), amount);
-                if sender.send(event.clone()).await.is_err() {
-                    return Err(SimulationError::MpscChannelError (format!("Stopped activity producer for {amount}: {source} -> {destination}.")));
+                select!{
+                    biased;
+                    _ = listener.clone() => {
+                        return Ok(());
+                    },
+                    send_event_result = sender.send(event.clone()) => {
+                        if send_event_result.is_err(){
+                            return Err(SimulationError::MpscChannelError (format!("Stopped activity producer for {amount}: {source} -> {destination}.")));
+                        }
+                    },
                 }
 
                 current_count += 1;
