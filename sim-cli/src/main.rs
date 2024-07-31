@@ -91,6 +91,7 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    console_subscriber::init();
 
     SimpleLogger::new()
         .with_level(LevelFilter::Warn)
