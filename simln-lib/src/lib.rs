@@ -602,6 +602,8 @@ impl Simulation {
                 clock.clone(),
                 cfg.write_results.clone(),
                 latency,
+                vec![],
+                shutdown_listener.clone(),
                 shutdown_trigger.clone(),
             )
             .map_err(|e| SimulationError::SimulatedNetworkError(format!("{:?}", e)))?,

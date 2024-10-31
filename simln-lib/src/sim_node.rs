@@ -15,13 +15,17 @@ use lightning::ln::msgs::{
 };
 use lightning::ln::{PaymentHash, PaymentPreimage};
 use lightning::routing::gossip::{NetworkGraph, NodeId};
-use lightning::routing::router::{find_route, Path, PaymentParameters, Route, RouteParameters};
+use lightning::routing::router::{
+    find_route, Path, PaymentParameters, Route, RouteHop, RouteParameters,
+};
 use lightning::routing::scoring::ProbabilisticScorer;
 use lightning::routing::utxo::{UtxoLookup, UtxoResult};
 use lightning::util::logger::{Level, Logger, Record};
 use rand_distr::{Distribution, Poisson};
 use serde::{Deserialize, Serialize};
 use std::collections::{hash_map::Entry, HashMap};
+use std::error::Error;
+use std::fmt::Display;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -83,6 +87,10 @@ pub enum ForwardingError {
     /// Sanity check on channel balances failed (node balances / channel capacity).
     #[error("SanityCheckFailed: node balance: {0} != capacity: {1}")]
     SanityCheckFailed(u64, u64),
+    #[error("InterceptorError: {0}")]
+    InterceptorError(Box<dyn Error + Send + Sync + 'static>),
+    #[error("DuplicateCustomRecord: key {0}")]
+    DuplicateCustomRecord(u64),
 }
 
 impl ForwardingError {
@@ -97,6 +105,7 @@ impl ForwardingError {
                 | ForwardingError::PaymentHashNotFound(_)
                 | ForwardingError::SanityCheckFailed(_, _)
                 | ForwardingError::FeeOverflow(_, _, _)
+                | ForwardingError::DuplicateCustomRecord(_)
         )
     }
 }
@@ -680,6 +689,115 @@ impl GraphNodeInfo {
     }
 }
 
+#[async_trait]
+pub trait Interceptor: Send + Sync {
+    /// Implemented by HTLC interceptors that provide input on the resolution of HTLCs forwarded in the simulation.
+    async fn intercept_htlc(&self, req: InterceptRequest);
+
+    /// Returns an identifying name for the interceptor for logging, does not need to be unique.
+    fn name(&self) -> String;
+}
+
+/// Request sent to an external interceptor to provide feedback on the resolution of the HTLC.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct InterceptRequest {
+    /// The node that is forwarding this HTLC.
+    pub forwarding_node: PublicKey,
+
+    /// The short channel id for the incoming channel that this htlc was delivered on.
+    pub incoming_htlc: HtlcRef,
+
+    /// Custom records provided by the incoming htlc.
+    pub incoming_custom_records: CustomRecords,
+
+    /// The short channel id for the outgoing channel that this htlc should be forwarded over.
+    pub outgoing_channel_id: Option<ShortChannelID>,
+
+    /// The amount that was forwarded to over the incoming_channel_id.
+    pub incoming_amount_msat: u64,
+
+    /// The amount that will be forwarded over outgoing_channel_id.
+    pub outgoing_amount_msat: u64,
+
+    /// The expiry height on the incoming htlc.
+    pub incoming_expiry_height: u32,
+
+    /// The expiry height on the outgoing htlc.
+    pub outgoing_expiry_height: u32,
+
+    /// Channel to send a single interception response on. This channel will be closed if the caller no longer requires
+    /// input from the interceptor. This will happen if another interceptor has returned with a HTLC fail/error, or the
+    /// simulator is shutting down.
+    ///
+    /// Callers that wish to exit early *may* listen on [`Sender::closed`]. Handlers that do not watch for closed
+    /// channels *must* expect [`tokio::sync::mpsc::error::SendError`] when they call [`Sender::send()`] and the
+    /// interceptor is no longer required.
+    ///
+    /// The top level of the nested result is used to indicate that the interceptor call succeeded, and the inner
+    /// result represents an instruction to forward or fail the payment itself. In the case of successful forward,
+    /// an optional set of custom records may be provided which will be forwarded to the next hop in the route. Records
+    /// from different interceptors are merged, and may not provide conflicting values for the same key.
+    pub response: tokio::sync::mpsc::Sender<
+        Result<Result<CustomRecords, ForwardingError>, Box<dyn Error + Send + Sync + 'static>>,
+    >,
+}
+
+impl InterceptRequest {
+    fn new(
+        hop: RouteHop,
+        incoming_amount_msat: u64,
+        incoming_htlc: HtlcRef,
+        incoming_custom_records: CustomRecords,
+        outgoing_channel_id: Option<ShortChannelID>,
+        incoming_expiry_height: u32,
+        response: tokio::sync::mpsc::Sender<
+            Result<Result<CustomRecords, ForwardingError>, Box<dyn Error + Send + Sync + 'static>>,
+        >,
+    ) -> Self {
+        Self {
+            forwarding_node: hop.pubkey,
+            outgoing_channel_id,
+            incoming_amount_msat,
+            incoming_htlc,
+            incoming_custom_records,
+            outgoing_amount_msat: incoming_amount_msat - hop.fee_msat,
+            incoming_expiry_height,
+            outgoing_expiry_height: incoming_expiry_height - hop.cltv_expiry_delta,
+            response,
+        }
+    }
+}
+
+impl Display for InterceptRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "htlc forwarded by {} over {}:{} -> {} forward amounts {} {}",
+            self.forwarding_node,
+            self.incoming_htlc.channel_id,
+            self.incoming_htlc.index,
+            {
+                if let Some(c) = self.outgoing_channel_id {
+                    format!("-> {c}")
+                } else {
+                    "receive".to_string()
+                }
+            },
+            self.incoming_amount_msat,
+            self.outgoing_amount_msat
+        )
+    }
+}
+
+pub type CustomRecords = HashMap<u64, Vec<u8>>;
+
+#[derive(Clone, Debug)]
+pub struct HtlcRef {
+    pub channel_id: ShortChannelID,
+    pub index: u64,
+}
+
 /// Graph is the top level struct that is used to coordinate simulation of lightning nodes.
 pub struct SimGraph {
     /// nodes caches the list of nodes in the network with a vector of their channel capacities, only used for quick
@@ -700,6 +818,14 @@ pub struct SimGraph {
     /// Optionally included to provide per-hop latency for simulated nodes, NB: expressed in milliseconds.
     latency: Option<Poisson<f32>>,
 
+    /// Optional set of interceptors that will be called every time a HTLC is added to a simulated channel. Given
+    /// a route A -- B -- C, events will happen in the following order:
+    ///
+    interceptors: Vec<Arc<dyn Interceptor>>,
+
+    /// listen for the instruction to shut down.
+    shutdown_listener: Listener,
+
     /// trigger shutdown if a critical error occurs.
     shutdown_trigger: Trigger,
 }
@@ -711,6 +837,8 @@ impl SimGraph {
         clock: Arc<dyn Clock>,
         write_results: Option<WriteResults>,
         latency_ms: Option<f32>,
+        interceptors: Vec<Arc<dyn Interceptor>>,
+        shutdown_listener: Listener,
         shutdown_trigger: Trigger,
     ) -> Result<Self, SimulationError> {
         let mut nodes: HashMap<PublicKey, GraphNodeInfo> = HashMap::new();
@@ -773,6 +901,8 @@ impl SimGraph {
                 None
             },
             tasks: JoinSet::new(),
+            interceptors,
+            shutdown_listener,
             shutdown_trigger,
         })
     }
@@ -928,6 +1058,8 @@ impl SimNetwork for SimGraph {
             source,
             route: path.clone(),
             payment_hash,
+            interceptors: self.interceptors.clone(),
+            listener: self.shutdown_listener.clone(),
             sender,
             writer: self.writer.clone(),
             latency: self.latency,
@@ -991,10 +1123,15 @@ async fn add_htlcs(
     payment_hash: PaymentHash,
     latency: Option<Poisson<f32>>,
     clock: Arc<dyn Clock>,
+    interceptors: Vec<Arc<dyn Interceptor>>,
+    listener: Listener,
 ) -> Result<(), (Option<usize>, ForwardingError)> {
     let mut outgoing_node = source;
     let mut outgoing_amount = route.fee_msat() + route.final_value_msat();
     let mut outgoing_cltv = route.hops.iter().map(|hop| hop.cltv_expiry_delta).sum();
+
+    // Start with no custom records on the htlc (we don't have the ability to set them at the moment
+    let mut incoming_custom_records = HashMap::new();
 
     // Tracks the hop index that we need to remove htlcs from on payment completion (both success and failure).
     // Given a payment from A to C, over the route A -- B -- C, this index has the following meanings:
@@ -1002,7 +1139,7 @@ async fn add_htlcs(
     // - Some(0): A -- B added the HTLC but B could not forward the HTLC to C, so it only needs removing on A -- B.
     // - Some(1): A -- B and B -- C added the HTLC, so it should be removed from the full route.
     let mut fail_idx = None;
-
+    let last_hop = route.hops.len() - 1;
     for (i, hop) in route.hops.iter().enumerate() {
         // Lock the node that we want to add the HTLC to next. We choose to lock one hop at a time (rather than for
         // the whole route) so that we can mimic the behavior of payments in the real network where the HTLCs in a
@@ -1010,8 +1147,9 @@ async fn add_htlcs(
         let mut node_lock = nodes.lock().await;
         let scid = ShortChannelID::from(hop.short_channel_id);
 
-        if let Some(channel) = node_lock.get_mut(&scid) {
-            channel
+        let (incoming_htlc, next_scid) = {
+            if let Some(channel) = node_lock.get_mut(&scid) {
+                let htlc_index = channel
                 .add_htlc(
                     &outgoing_node,
                     payment_hash,
@@ -1026,21 +1164,22 @@ async fn add_htlcs(
                 // have to progress our fail_idx.
                 .map_err(|e| (fail_idx, e))?;
 
-            // If the HTLC was successfully added, then we'll need to remove the HTLC from this channel if we fail,
-            // so we progress our failure index to include this node.
-            fail_idx = Some(i);
+                // If the HTLC was successfully added, then we'll need to remove the HTLC from this channel if we fail,
+                // so we progress our failure index to include this node.
+                fail_idx = Some(i);
 
-            // Once we've added the HTLC on this hop's channel, we want to check whether it has sufficient fee
-            // and CLTV delta per the _next_ channel's policy (because fees and CLTV delta in LN are charged on
-            // the outgoing link). We check the policy belonging to the node that we just forwarded to, which
-            // represents the fee in that direction.
-            //
-            // TODO: add invoice-related checks (including final CTLV) if we support non-keysend payments.
-            if i != route.hops.len() - 1 {
-                if let Some(channel) =
-                    node_lock.get(&ShortChannelID::from(route.hops[i + 1].short_channel_id))
-                {
-                    channel
+                // Once we've added the HTLC on this hop's channel, we want to check whether it has sufficient fee
+                // and CLTV delta per the _next_ channel's policy (because fees and CLTV delta in LN are charged on
+                // the outgoing link). We check the policy belonging to the node that we just forwarded to, which
+                // represents the fee in that direction.
+                //
+                // TODO: add invoice-related checks (including final CTLV) if we support non-keysend payments.
+                let mut next_scid = None;
+                if i != last_hop {
+                    next_scid = Some(ShortChannelID::from(route.hops[i + 1].short_channel_id));
+
+                    if let Some(channel) = node_lock.get(&next_scid.unwrap()) {
+                        channel
                         .check_htlc_forward(
                             &hop.pubkey,
                             hop.cltv_expiry_delta,
@@ -1050,16 +1189,112 @@ async fn add_htlcs(
                         // If we haven't met forwarding conditions for the next channel's policy, then we fail at
                         // the current index, because we've already added the HTLC as outgoing.
                         .map_err(|e| (fail_idx, e))?;
+                    }
+                }
+
+                (
+                    HtlcRef {
+                        channel_id: scid,
+                        index: htlc_index,
+                    },
+                    next_scid,
+                )
+            } else {
+                return Err((fail_idx, ForwardingError::ChannelNotFound(scid)));
+            }
+        };
+
+        // Before we continue on to the next hop, we'll call any interceptors registered to get external input on the
+        // forwarding decision for this HTLC.
+        //
+        // We drop our node lock so that we can await our interceptors (which may choose to hold the HTLC for a long
+        // time) without holding our entire graph hostage.
+        drop(node_lock);
+
+        // Collect any custom records set by the interceptor for the outgoing link. We could overload
+        // incoming_custom_records for this purpose, but we keep it simple for now.
+        let mut outgoing_custom_records: HashMap<u64, Vec<u8>> = HashMap::new();
+
+        if !interceptors.is_empty() {
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(interceptors.len());
+            for interceptor in interceptors.iter() {
+                let request = InterceptRequest::new(
+                    hop.clone(),
+                    // We've just added the outgoing amount to the sending node, and we're notifying the forward to its
+                    // peer that has just received an incoming htlc, so the outgoing amount added to the sending node
+                    // is the incoming amount for the forwarding node.
+                    outgoing_amount,
+                    incoming_htlc.clone(),
+                    incoming_custom_records.clone(),
+                    next_scid,
+                    outgoing_cltv,
+                    sender.clone(),
+                );
+
+                log::trace!(
+                    "Sending HTLC to intercepor: {} {request}",
+                    interceptor.name()
+                );
+                interceptor.intercept_htlc(request).await;
+            }
+
+            // Read results from all of our interceptors, tracking whether any of them returned an instruction to fail
+            // the HTLC. Once we get a terminal signal (a shutdown or HTLC failure), we'll close the receiving channel
+            // and drain any remaining messages to ensure that we do not block any callers.
+            let mut interceptor_failure = None;
+            'get_resp: for i in 0..interceptors.len() {
+                log::trace!("Waiting for interceptor: {i}");
+
+                select! {
+                biased;
+                _ = listener.clone() => {
+                    receiver.close();
+                },
+                resp = receiver.recv() =>{
+                        match resp {
+                            // Interceptor call succeeded and indicated that we should proceed with the forward. Merge
+                            // any custom records provided, failing if interceptors provide duplicate values for the
+                            // same key.
+                            Some(Ok(Ok(records))) => {
+                                for (k, v) in records{
+                                    match outgoing_custom_records.entry(k){
+                                        Entry::Occupied(e) => {
+                                            let existing_value = e.get();
+                                            if *existing_value != v {
+                                                return Err((fail_idx, ForwardingError::DuplicateCustomRecord(k)))
+                                            }
+                                        },
+                                        Entry::Vacant(e) => {e.insert(v);},
+                                    };
+                                }
+                            },
+                            // Interceptor call succeeded, but it indicated that we should not proceed with the forward.
+                            Some(Ok(Err(f))) => {
+                                interceptor_failure = Some(f);
+                                receiver.close();
+                            }
+                            // If the interceptor call itself failed, we need to shut down the full simulation because
+                            // something has errored out.
+                            Some(Err(e)) => {
+                                return Err((fail_idx, ForwardingError::InterceptorError(e)))
+                            },
+                            None => break 'get_resp
+                        }
+                    },
                 }
             }
-        } else {
-            return Err((fail_idx, ForwardingError::ChannelNotFound(scid)));
+
+            if let Some(f) = interceptor_failure {
+                return Err((fail_idx, f));
+            }
         }
 
-        // Once we've taken the "hop" to the destination pubkey, it becomes the source of the next outgoing htlc.
+        // Once we've taken the "hop" to the destination pubkey, it becomes the source of the next outgoing htlc and
+        // any outgoing custom records set by the interceptor become the incoming custom records for the next hop.
         outgoing_node = hop.pubkey;
         outgoing_amount -= hop.fee_msat;
         outgoing_cltv -= hop.cltv_expiry_delta;
+        incoming_custom_records = outgoing_custom_records;
 
         if let Some(p) = latency {
             let latency = p.sample(&mut rand::thread_rng());
@@ -1139,6 +1374,8 @@ struct PropagatePaymentRequest {
     writer: Option<Arc<Mutex<BatchedWriter>>>,
     latency: Option<Poisson<f32>>,
     clock: Arc<dyn Clock>,
+    interceptors: Vec<Arc<dyn Interceptor>>,
+    listener: Listener,
     shutdown: Trigger,
 }
 
@@ -1156,6 +1393,8 @@ async fn propagate_payment(request: PropagatePaymentRequest) {
         request.payment_hash,
         request.latency,
         request.clock.clone(),
+        request.interceptors,
+        request.listener,
     )
     .await
     {
@@ -1871,7 +2110,7 @@ mod tests {
         ///
         /// The nodes pubkeys in this chain of channels are provided in-order for easy access.
         async fn new(capacity: u64) -> Self {
-            let (shutdown, _listener) = triggered::trigger();
+            let (shutdown, listener) = triggered::trigger();
             let channels = create_simulated_channels(3, capacity);
 
             // Collect pubkeys in-order, pushing the last node on separately because they don't have an outgoing
@@ -1889,6 +2128,8 @@ mod tests {
                     clock.clone(),
                     None,
                     None,
+                    vec![],
+                    listener.clone(),
                     shutdown.clone(),
                 )
                 .expect("could not create test graph"),
