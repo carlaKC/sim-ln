@@ -295,6 +295,7 @@ pub struct SimulatedChannel {
     short_channel_id: ShortChannelID,
     node_1: ChannelState,
     node_2: ChannelState,
+    forward_only: bool,
 }
 
 impl SimulatedChannel {
@@ -305,12 +306,14 @@ impl SimulatedChannel {
         short_channel_id: ShortChannelID,
         node_1: ChannelPolicy,
         node_2: ChannelPolicy,
+        forward_only: bool,
     ) -> Self {
         SimulatedChannel {
             capacity_msat,
             short_channel_id,
             node_1: ChannelState::new(node_1, capacity_msat / 2),
             node_2: ChannelState::new(node_2, capacity_msat / 2),
+            forward_only,
         }
     }
 
@@ -442,6 +445,7 @@ impl From<NetworkParser> for SimulatedChannel {
             network_parser.scid,
             network_parser.node_1,
             network_parser.node_2,
+            network_parser.forward_only,
         )
     }
 }
@@ -652,12 +656,12 @@ impl<T: SimNetwork> LightningNode for SimNode<'_, T> {
 
 /// Stores information about simulated nodes for quick lookup.
 struct GraphNodeInfo {
-    channel_capacities: Vec<u64>,
+    channel_capacities: Vec<(u64, bool)>,
     alias: String,
 }
 
 impl GraphNodeInfo {
-    fn new(channel_capacities: Vec<u64>, alias: String) -> Self {
+    fn new(channel_capacities: Vec<(u64, bool)>, alias: String) -> Self {
         GraphNodeInfo {
             channel_capacities,
             alias,
@@ -716,15 +720,16 @@ impl SimGraph {
             };
 
             // It's okay to have duplicate pubkeys because one node can have many channels.
-            for policy in [&channel.node_1.policy, &channel.node_2.policy] {
-                match nodes.entry(policy.pubkey) {
-                    Entry::Occupied(o) => {
-                        o.into_mut().channel_capacities.push(channel.capacity_msat)
-                    },
+            for node in [&channel.node_1, &channel.node_2] {
+                match nodes.entry(node.policy.pubkey) {
+                    Entry::Occupied(o) => o
+                        .into_mut()
+                        .channel_capacities
+                        .push((channel.capacity_msat, channel.forward_only)),
                     Entry::Vacant(v) => {
                         v.insert(GraphNodeInfo::new(
-                            vec![channel.capacity_msat],
-                            policy.alias.clone(),
+                            vec![(channel.capacity_msat, channel.forward_only)],
+                            node.policy.alias.clone(),
                         ));
                     },
                 }
@@ -791,6 +796,18 @@ pub async fn ln_node_from_graph<'a>(
     let mut nodes: HashMap<PublicKey, Arc<Mutex<dyn LightningNode>>> = HashMap::new();
 
     for (pk, info) in graph.lock().await.nodes.iter() {
+        // Channels that are forward-only should be handled by our simulated graph, but not surfaced for the simulator
+        // to generate activity on (they're only there to forward payments). If we have a node which only has such
+        // channels, we exclude it completely.
+        if info.channel_capacities.iter().all(|c| c.1) {
+            log::debug!(
+                "Node: {} ({pk}) only has forward-only channels, not including in simulation",
+                info.alias
+            );
+
+            continue;
+        }
+
         nodes.insert(
             *pk,
             Arc::new(Mutex::new(SimNode::new(
@@ -918,7 +935,19 @@ impl SimNetwork for SimGraph {
             .map(|sim_node_info| {
                 (
                     node_info(*pubkey, sim_node_info.alias.clone()),
-                    sim_node_info.channel_capacities.clone(),
+                    sim_node_info
+                        .channel_capacities
+                        .iter()
+						// We only want channels that are *not* forward only.
+                        .filter(|c| {
+							if c.1{
+								log::trace!("Skipping channel for: {} with capacity {} due to forward only.",
+									sim_node_info.alias, c.0)
+							}
+							!c.1
+						})
+                        .map(|c| c.0)
+                        .collect(),
                 )
             })
             .ok_or(LightningError::GetNodeInfoError(
@@ -1391,6 +1420,7 @@ mod tests {
                 short_channel_id: ShortChannelID::from(i),
                 node_1: ChannelState::new(node_1_to_2, capacity_msat),
                 node_2: ChannelState::new(node_2_to_1, 0),
+                forward_only: false,
             });
 
             // Progress source ID to create a chain of nodes.
@@ -1656,6 +1686,7 @@ mod tests {
             short_channel_id: ShortChannelID::from(123),
             node_1: node_1.clone(),
             node_2: node_2.clone(),
+            forward_only: false,
         };
 
         // Assert that we're not able to send a htlc over node_2 -> node_1 (no liquidity).
