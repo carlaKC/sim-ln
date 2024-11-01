@@ -912,17 +912,17 @@ impl SimNetwork for SimGraph {
             },
         };
 
-        self.tasks.spawn(propagate_payment(
-            self.channels.clone(),
+        self.tasks.spawn(propagate_payment(PropagatePaymentRequest {
+            nodes: self.channels.clone(),
             source,
-            path.clone(),
+            route: path.clone(),
             payment_hash,
             sender,
-            self.writer.clone(),
-            self.latency,
-            self.clock.clone(),
-            self.shutdown_trigger.clone(),
-        ));
+            writer: self.writer.clone(),
+            latency: self.latency,
+            clock: self.clock.clone(),
+            shutdown: self.shutdown_trigger.clone(),
+        }));
     }
 
     /// lookup_node fetches a node's information and channel capacities.
@@ -1120,11 +1120,7 @@ async fn remove_htlcs(
     Ok(route_htlcs.into_iter().rev().collect())
 }
 
-/// Finds a payment path from the source to destination nodes provided, and propagates the appropriate htlcs through
-/// the simulated network, notifying the sender channel provided of the payment outcome. If a critical error occurs,
-/// ie a breakdown of our state machine, it will still notify the payment outcome and will use the shutdown trigger
-#[allow(clippy::too_many_arguments)]
-async fn propagate_payment(
+struct PropagatePaymentRequest {
     nodes: Arc<Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
     source: PublicKey,
     route: Path,
@@ -1134,37 +1130,43 @@ async fn propagate_payment(
     latency: Option<Poisson<f32>>,
     clock: Arc<dyn Clock>,
     shutdown: Trigger,
-) {
+}
+
+/// Finds a payment path from the source to destination nodes provided, and propagates the appropriate htlcs through
+/// the simulated network, notifying the sender channel provided of the payment outcome. If a critical error occurs,
+/// ie a breakdown of our state machine, it will still notify the payment outcome and will use the shutdown trigger
+/// to signal that we should exit.
+async fn propagate_payment(request: PropagatePaymentRequest) {
     // If we partially added HTLCs along the route, we need to fail them back to the source to clean up our partial
     // state. It's possible that we failed with the very first add, and then we don't need to clean anything up.
     let notify_result = if let Err((fail_idx, err)) = add_htlcs(
-        nodes.clone(),
-        source,
-        route.clone(),
-        payment_hash,
-        latency,
-        clock.clone(),
+        request.nodes.clone(),
+        request.source,
+        request.route.clone(),
+        request.payment_hash,
+        request.latency,
+        request.clock.clone(),
     )
     .await
     {
         if err.is_critical() {
-            shutdown.trigger();
+            request.shutdown.trigger();
         }
 
         if let Some(resolution_idx) = fail_idx {
             if let Err(e) = remove_htlcs(
-                nodes,
+                request.nodes,
                 resolution_idx,
-                source,
-                route,
-                payment_hash,
+                request.source,
+                request.route,
+                request.payment_hash,
                 false,
-                clock.clone(),
+                request.clock.clone(),
             )
             .await
             {
                 if e.is_critical() {
-                    shutdown.trigger();
+                    request.shutdown.trigger();
                 }
             }
         }
@@ -1173,7 +1175,7 @@ async fn propagate_payment(
         // actual failure reason and then fail back with unknown failure type.
         log::debug!(
             "Forwarding failure for simulated payment {}: {err}",
-            hex::encode(payment_hash.0)
+            hex::encode(request.payment_hash.0)
         );
 
         PaymentResult {
@@ -1183,29 +1185,31 @@ async fn propagate_payment(
     } else {
         // If we successfully added the htlc, go ahead and remove all the htlcs in the route with successful resolution.
         match remove_htlcs(
-            nodes.clone(),
-            route.hops.len() - 1,
-            source,
-            route.clone(),
-            payment_hash,
+            request.nodes.clone(),
+            request.route.hops.len() - 1,
+            request.source,
+            request.route.clone(),
+            request.payment_hash,
             true,
-            clock.clone(),
+            request.clock.clone(),
         )
         .await
         {
             // If we successfully removed the htlcs, we can write the forwarding results to
             // disk. We do not expect this operation to fail and can shutdown if it does.
             Ok(htlcs) => {
-                if let Some(w) = writer {
-                    if let Err(e) = write_forwards(w, htlcs, route, nodes).await {
+                if let Some(w) = request.writer {
+                    if let Err(e) =
+                        write_forwards(w, htlcs, request.route.clone(), request.nodes.clone()).await
+                    {
                         log::error!("Could not write forwards: {e}");
-                        shutdown.trigger();
+                        request.shutdown.trigger();
                     }
                 }
             },
             Err(e) => {
                 if e.is_critical() {
-                    shutdown.trigger();
+                    request.shutdown.trigger();
                 }
 
                 log::error!("Could not remove htlcs from channel: {e}.");
@@ -1218,7 +1222,7 @@ async fn propagate_payment(
         }
     };
 
-    if let Err(e) = sender.send(Ok(notify_result)) {
+    if let Err(e) = request.sender.send(Ok(notify_result)) {
         log::error!("Could not notify payment result: {:?}.", e);
     }
 }
