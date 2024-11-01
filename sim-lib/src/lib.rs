@@ -190,6 +190,8 @@ pub struct NetworkParser {
     pub capacity_msat: u64,
     pub node_1: ChannelPolicy,
     pub node_2: ChannelPolicy,
+    #[serde(default)]
+    pub forward_only: bool,
 }
 
 /// Data structure used to parse information from the simulation file. It allows source and destination to be
@@ -617,7 +619,7 @@ impl Simulation {
 
         Ok((
             Self {
-                nodes,
+                nodes, // Here we should filter nodes out!
                 activity,
                 shutdown_trigger,
                 shutdown_listener,
