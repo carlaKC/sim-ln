@@ -591,7 +591,6 @@ impl Simulation {
         channels: Vec<SimulatedChannel>,
         activity: Vec<ActivityDefinition>,
         clock_speedup: u32,
-        latency: Option<f32>,
     ) -> Result<(Self, Arc<Mutex<SimGraph>>), SimulationError> {
         let (shutdown_trigger, shutdown_listener) = triggered::trigger();
         let clock = Arc::new(SimulationClock::new(clock_speedup)?);
@@ -602,7 +601,6 @@ impl Simulation {
                 channels.clone(),
                 clock.clone(),
                 cfg.write_results.clone(),
-                latency,
                 Arc::new(vec![]),
                 shutdown_listener.clone(),
                 shutdown_trigger.clone(),
