@@ -836,9 +836,6 @@ pub struct SimGraph {
     /// Optional writer to flush htlc forwards to disk.
     writer: Option<Arc<Mutex<BatchedWriter>>>,
 
-    /// Optionally included to provide per-hop latency for simulated nodes, NB: expressed in milliseconds.
-    latency: Option<Poisson<f32>>,
-
     /// Optional set of interceptors that will be called every time a HTLC is added to a simulated channel. Given
     /// a route A -- B -- C, events will happen in the following order:
     ///
@@ -857,7 +854,6 @@ impl SimGraph {
         graph_channels: Vec<SimulatedChannel>,
         clock: Arc<dyn Clock>,
         write_results: Option<WriteResults>,
-        latency_ms: Option<f32>,
         interceptors: Arc<Vec<Box<dyn Interceptor>>>,
         shutdown_listener: Listener,
         shutdown_trigger: Trigger,
@@ -911,16 +907,6 @@ impl SimGraph {
             channels: Arc::new(Mutex::new(channels)),
             clock,
             writer,
-            latency: if let Some(l) = latency_ms {
-                Some(Poisson::new(l).map_err(|e| {
-                    SimulationError::SimulatedNetworkError(format!(
-                        "could not create latency distribution: {}",
-                        e
-                    ))
-                })?)
-            } else {
-                None
-            },
             tasks: JoinSet::new(),
             interceptors,
             shutdown_listener,
@@ -1083,7 +1069,6 @@ impl SimNetwork for SimGraph {
             listener: self.shutdown_listener.clone(),
             sender,
             writer: self.writer.clone(),
-            latency: self.latency,
             clock: self.clock.clone(),
             shutdown: self.shutdown_trigger.clone(),
         }));
@@ -1142,7 +1127,6 @@ async fn add_htlcs(
     source: PublicKey,
     route: Path,
     payment_hash: PaymentHash,
-    latency: Option<Poisson<f32>>,
     clock: Arc<dyn Clock>,
     interceptors: Arc<Vec<Box<dyn Interceptor>>>,
     listener: Listener,
@@ -1316,16 +1300,6 @@ async fn add_htlcs(
         outgoing_amount -= hop.fee_msat;
         outgoing_cltv -= hop.cltv_expiry_delta;
         incoming_custom_records = outgoing_custom_records;
-
-        if let Some(p) = latency {
-            let latency = p.sample(&mut rand::thread_rng());
-            log::trace!("Latency for simualted htlc: {latency}");
-
-            // TODO: include this in a select with listener otherwise we will have to wait for our latency sleep to
-            // be over before we can exit when the signal comes. This isn't dramatic because we're talking small values
-            // but it's a bit dirty.
-            clock.sleep(Duration::from_millis(latency as u64)).await;
-        }
     }
 
     Ok(())
@@ -1414,7 +1388,6 @@ struct PropagatePaymentRequest {
     payment_hash: PaymentHash,
     sender: Sender<Result<PaymentResult, LightningError>>,
     writer: Option<Arc<Mutex<BatchedWriter>>>,
-    latency: Option<Poisson<f32>>,
     clock: Arc<dyn Clock>,
     interceptors: Arc<Vec<Box<dyn Interceptor>>>,
     listener: Listener,
@@ -1433,7 +1406,6 @@ async fn propagate_payment(request: PropagatePaymentRequest) {
         request.source,
         request.route.clone(),
         request.payment_hash,
-        request.latency,
         request.clock.clone(),
         request.interceptors.clone(),
         request.listener,
@@ -2170,7 +2142,6 @@ mod tests {
                 graph: SimGraph::new(
                     channels.clone(),
                     clock.clone(),
-                    None,
                     None,
                     Arc::new(vec![]),
                     listener.clone(),
