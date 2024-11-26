@@ -166,8 +166,11 @@ macro_rules! fail_forwarding_inequality {
 #[derive(Clone)]
 struct ChannelState {
     local_balance_msat: u64,
-    in_flight: HashMap<PaymentHash, Htlc>,
+    /// Maps payment hash to htlc and index that it was added at.
+    in_flight: HashMap<PaymentHash, (Htlc, u64)>,
     policy: ChannelPolicy,
+    /// Tracks unique identifier for htlcs proposed by this node (sent in the outgoing direction).
+    index: u64,
 }
 
 impl ChannelState {
@@ -179,12 +182,13 @@ impl ChannelState {
             local_balance_msat,
             in_flight: HashMap::new(),
             policy,
+            index: 0,
         }
     }
 
     /// Returns the sum of all the *in flight outgoing* HTLCs on the channel.
     fn in_flight_total(&self) -> u64 {
-        self.in_flight.values().map(|h| h.amount_msat).sum()
+        self.in_flight.values().map(|h| h.0.amount_msat).sum()
     }
 
     /// Checks whether the proposed HTLC abides by the channel policy advertised for using this channel as the
@@ -238,18 +242,22 @@ impl ChannelState {
     ///
     /// Note: MPP payments are not currently supported, so this function will fail if a duplicate payment hash is
     /// reported.
-    fn add_outgoing_htlc(&mut self, hash: PaymentHash, htlc: Htlc) -> Result<(), ForwardingError> {
+    fn add_outgoing_htlc(&mut self, hash: PaymentHash, htlc: Htlc) -> Result<u64, ForwardingError> {
         self.check_outgoing_addition(&htlc)?;
         if self.in_flight.get(&hash).is_some() {
             return Err(ForwardingError::PaymentHashExists(hash));
         }
+        let index = self.index;
+        self.index += 1;
+
         self.local_balance_msat -= htlc.amount_msat;
-        self.in_flight.insert(hash, htlc);
-        Ok(())
+        self.in_flight.insert(hash, (htlc, index));
+
+        Ok(index)
     }
 
     /// Removes the HTLC from our set of outgoing in-flight HTLCs, failing if the payment hash is not found.
-    fn remove_outgoing_htlc(&mut self, hash: &PaymentHash) -> Result<Htlc, ForwardingError> {
+    fn remove_outgoing_htlc(&mut self, hash: &PaymentHash) -> Result<(Htlc, u64), ForwardingError> {
         self.in_flight
             .remove(hash)
             .ok_or(ForwardingError::PaymentHashNotFound(*hash))
@@ -360,14 +368,17 @@ impl SimulatedChannel {
         sending_node: &PublicKey,
         hash: PaymentHash,
         htlc: Htlc,
-    ) -> Result<(), ForwardingError> {
+    ) -> Result<u64, ForwardingError> {
         if htlc.amount_msat == 0 {
             return Err(ForwardingError::ZeroAmountHtlc);
         }
 
-        self.get_node_mut(sending_node)?
+        let index = self
+            .get_node_mut(sending_node)?
             .add_outgoing_htlc(hash, htlc)?;
-        self.sanity_check()
+        self.sanity_check()?;
+
+        Ok(index)
     }
 
     /// Performs a sanity check on the total balances in a channel. Note that we do not currently include on-chain
@@ -391,13 +402,13 @@ impl SimulatedChannel {
         hash: &PaymentHash,
         success: bool,
         remove_time: SystemTime,
-    ) -> Result<Htlc, ForwardingError> {
+    ) -> Result<(Htlc, u64), ForwardingError> {
         let mut htlc = self
             .get_node_mut(sending_node)?
             .remove_outgoing_htlc(hash)?;
-        htlc.remove_ts = Some(remove_time);
+        htlc.0.remove_ts = Some(remove_time);
 
-        self.settle_htlc(sending_node, htlc.amount_msat, success)?;
+        self.settle_htlc(sending_node, htlc.0.amount_msat, success)?;
         self.sanity_check()?;
 
         Ok(htlc)
@@ -1102,12 +1113,11 @@ async fn remove_htlcs(
             .get_mut(&ShortChannelID::from(hop.short_channel_id))
         {
             Some(channel) => {
-                route_htlcs.push(channel.remove_htlc(
-                    &incoming_node,
-                    &payment_hash,
-                    success,
-                    clock.now(),
-                )?);
+                route_htlcs.push(
+                    channel
+                        .remove_htlc(&incoming_node, &payment_hash, success, clock.now())?
+                        .0,
+                );
             },
             None => {
                 return Err(ForwardingError::ChannelNotFound(ShortChannelID::from(
