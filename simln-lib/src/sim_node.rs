@@ -693,8 +693,31 @@ pub trait Interceptor: Send + Sync {
     /// Implemented by HTLC interceptors that provide input on the resolution of HTLCs forwarded in the simulation.
     async fn intercept_htlc(&self, req: InterceptRequest);
 
+    /// Notifies the interceptor that a previously intercepted htlc has been resolved. Default implementation is a no-op
+    /// for cases where the interceptor only cares about interception, not resolution of htlcs.
+    async fn notify_resolution(&self, _res: InterceptResolution) -> Result<(), Option<String>> {
+        Ok(())
+    }
+
     /// Returns an identifying name for the interceptor for logging, does not need to be unique.
     fn name(&self) -> String;
+}
+
+/// Notification sent to an external interceptor notifying that a htlc that was previously intercepted has been
+/// resolved.
+pub struct InterceptResolution {
+    /// The node that is forwarding this HTLC.
+    pub forwarding_node: PublicKey,
+
+    /// Unique identifier for the incoming htlc.
+    pub incoming_htlc: HtlcRef,
+
+    /// The short channel id for the outgoing channel that this htlc should be forwarded over, None if notifying the
+    /// receiving node.
+    pub outgoing_channel_id: Option<ShortChannelID>,
+
+    /// True if the htlc was settled successfully.
+    pub success: bool,
 }
 
 /// Request sent to an external interceptor to provide feedback on the resolution of the HTLC.
@@ -1325,9 +1348,11 @@ async fn remove_htlcs(
     payment_hash: PaymentHash,
     success: bool,
     clock: Arc<dyn Clock>,
+    interceptors: Arc<Vec<Box<dyn Interceptor>>>,
 ) -> Result<Vec<Htlc>, ForwardingError> {
     let mut route_htlcs: Vec<Htlc> = vec![];
 
+    let mut outgoing_channel_id = None;
     for (i, hop) in route.hops[0..=resolution_idx].iter().enumerate().rev() {
         // When we add HTLCs, we do so on the state of the node that sent the htlc along the channel so we need to
         // look up our incoming node so that we can remove it when we go backwards. For the first htlc, this is just
@@ -1340,24 +1365,43 @@ async fn remove_htlcs(
 
         // As with when we add HTLCs, we remove them one hop at a time (rather than locking for the whole route) to
         // mimic the behavior of payments in a real network.
-        match nodes
-            .lock()
-            .await
-            .get_mut(&ShortChannelID::from(hop.short_channel_id))
-        {
+        let mut node_lock = nodes.lock().await;
+        let incoming_scid = ShortChannelID::from(hop.short_channel_id);
+        let (removed_htlc, index) = match node_lock.get_mut(&incoming_scid) {
             Some(channel) => {
-                route_htlcs.push(
-                    channel
-                        .remove_htlc(&incoming_node, &payment_hash, success, clock.now())?
-                        .0,
-                );
+                channel.remove_htlc(&incoming_node, &payment_hash, success, clock.now())?
             },
             None => {
                 return Err(ForwardingError::ChannelNotFound(ShortChannelID::from(
                     hop.short_channel_id,
                 )))
             },
+        };
+
+        // Add removed htlc to list of htlcs.
+        route_htlcs.push(removed_htlc);
+
+        // We drop our node lock so that we can notify interceptors without blocking other payments processing.
+        drop(node_lock);
+
+        for interceptor in interceptors.iter() {
+            log::trace!("Sending resolution to interceptor: {}", interceptor.name());
+
+            interceptor
+                .notify_resolution(InterceptResolution {
+                    forwarding_node: hop.pubkey,
+                    incoming_htlc: HtlcRef {
+                        channel_id: incoming_scid,
+                        index,
+                    },
+                    outgoing_channel_id,
+                    success,
+                })
+                .await
+                .map_err(|e| ForwardingError::InterceptorError(e.unwrap_or_default()))?;
         }
+
+        outgoing_channel_id = Some(incoming_scid);
     }
 
     Ok(route_htlcs.into_iter().rev().collect())
@@ -1391,7 +1435,7 @@ async fn propagate_payment(request: PropagatePaymentRequest) {
         request.payment_hash,
         request.latency,
         request.clock.clone(),
-        request.interceptors,
+        request.interceptors.clone(),
         request.listener,
     )
     .await
@@ -1409,6 +1453,7 @@ async fn propagate_payment(request: PropagatePaymentRequest) {
                 request.payment_hash,
                 false,
                 request.clock.clone(),
+                request.interceptors.clone(),
             )
             .await
             {
@@ -1439,6 +1484,7 @@ async fn propagate_payment(request: PropagatePaymentRequest) {
             request.payment_hash,
             true,
             request.clock.clone(),
+            request.interceptors,
         )
         .await
         {
