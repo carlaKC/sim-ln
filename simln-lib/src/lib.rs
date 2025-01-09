@@ -593,8 +593,9 @@ impl Simulation {
         activity: Vec<ActivityDefinition>,
         clock_speedup: u32,
         interceptors: Vec<Arc<dyn Interceptor>>,
+        shutdown_listener: Listener,
+        shutdown_trigger: Trigger,
     ) -> Result<(Self, Arc<Mutex<SimGraph>>), SimulationError> {
-        let (shutdown_trigger, shutdown_listener) = triggered::trigger();
         let clock = Arc::new(SimulationClock::new(clock_speedup)?);
 
         // Setup a simulation graph that will handle propagation of payments through the network.

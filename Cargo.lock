@@ -2099,6 +2099,7 @@ dependencies = [
  "simln-lib",
  "simple_logger",
  "tokio",
+ "triggered",
 ]
 
 [[package]]

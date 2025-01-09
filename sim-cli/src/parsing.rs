@@ -202,12 +202,15 @@ pub async fn create_simulation(
             vec![]
         };
 
+        let (shutdown_trigger, shutdown_listener) = triggered::trigger();
         let (simulation, graph) = Simulation::new_with_sim_network(
             cfg,
             channels,
             validated_activities,
             cli.clock_speedup.unwrap_or(DEFAULT_CLOCK_SPEEDUP),
             interceptors,
+            shutdown_listener,
+            shutdown_trigger,
         )
         .await?;
         Ok((simulation, Some(graph)))
