@@ -45,7 +45,10 @@ stable-output:
 		echo "No unstaged or uncommitted changes found."; \
 	fi
 
-check: check-code stable-output
+version: 
+	rustc --version
+
+check: version check-code stable-output
 
 install:
 	cargo install --locked --path sim-cli
