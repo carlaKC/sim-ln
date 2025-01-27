@@ -236,7 +236,7 @@ impl ChannelState {
     /// reported.
     fn add_outgoing_htlc(&mut self, hash: PaymentHash, htlc: Htlc) -> Result<(), ForwardingError> {
         self.check_outgoing_addition(&htlc)?;
-        if self.in_flight.get(&hash).is_some() {
+        if self.in_flight.contains_key(&hash) {
             return Err(ForwardingError::PaymentHashExists(hash));
         }
         self.local_balance_msat -= htlc.amount_msat;
