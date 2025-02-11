@@ -986,7 +986,7 @@ pub async fn ln_node_from_graph<'a>(
 /// all of the fields required to apply node announcements. This means that we will not have node-level information
 /// (such as features) available in the routing graph.
 pub fn populate_network_graph<'a>(
-    channels: Vec<SimulatedChannel>,
+    channels: &Vec<SimulatedChannel>,
     clock: Arc<dyn Clock>,
 ) -> Result<NetworkGraph<&'a WrappedLog>, LdkError> {
     let graph = NetworkGraph::new(Network::Regtest, &WrappedLog {});
@@ -1022,7 +1022,7 @@ pub fn populate_network_graph<'a>(
 
         // The least significant bit of the channel flag field represents the direction that the channel update
         // applies to. This value is interpreted as node_1 if it is zero, and node_2 otherwise.
-        for (i, node) in [channel.node_1, channel.node_2].iter().enumerate() {
+        for (i, node) in [&channel.node_1, &channel.node_2].iter().enumerate() {
             let update = UnsignedChannelUpdate {
                 chain_hash,
                 short_channel_id: channel.short_channel_id.into(),
@@ -2048,7 +2048,7 @@ mod tests {
         let channels = create_simulated_channels(5, 300000000);
         let clock = Arc::new(SystemClock {});
 
-        let graph = populate_network_graph(channels.clone(), clock).unwrap();
+        let graph = populate_network_graph(&channels, clock).unwrap();
 
         // Create a simulated node for the first channel in our network.
         let info = node_info(channels[0].node_1.policy.pubkey, "".to_string());
@@ -2162,7 +2162,7 @@ mod tests {
                 )
                 .expect("could not create test graph"),
                 nodes,
-                routing_graph: populate_network_graph(channels, clock).unwrap(),
+                routing_graph: populate_network_graph(&channels, clock).unwrap(),
                 shutdown,
             };
 
