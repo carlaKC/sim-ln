@@ -2,8 +2,14 @@ use self::parsing::{create_simulation, Cli};
 use clap::Parser;
 use log::LevelFilter;
 use simple_logger::SimpleLogger;
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
 
 pub mod parsing;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
