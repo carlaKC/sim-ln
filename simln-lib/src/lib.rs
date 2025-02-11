@@ -596,11 +596,18 @@ impl Simulation {
         shutdown_listener: Listener,
         shutdown_trigger: Trigger,
     ) -> Result<(Self, Arc<Mutex<SimGraph>>), SimulationError> {
+        // Copy all of our simulated channels into a read-only routing graph, allowing us to pathfind for individual
+        // payments without locking the simulation graph (this is a duplication of our channels, but the performance
+        // tradeoff is worthwhile for concurrent pathfinding).
+        let routing_graph = Arc::new(
+            populate_network_graph(&channels, clock.clone())
+                .map_err(|e| SimulationError::SimulatedNetworkError(format!("{:?}", e)))?,
+        );
 
         // Setup a simulation graph that will handle propagation of payments through the network.
         let simulation_graph = Arc::new(Mutex::new(
             SimGraph::new(
-                channels.clone(),
+                channels,
                 clock.clone(),
                 cfg.write_results.clone(),
                 interceptors,
@@ -609,14 +616,6 @@ impl Simulation {
             )
             .map_err(|e| SimulationError::SimulatedNetworkError(format!("{:?}", e)))?,
         ));
-
-        // Copy all of our simulated channels into a read-only routing graph, allowing us to pathfind for individual
-        // payments without locking the simulation graph (this is a duplication of our channels, but the performance
-        // tradeoff is worthwhile for concurrent pathfinding).
-        let routing_graph = Arc::new(
-            populate_network_graph(channels, clock.clone())
-                .map_err(|e| SimulationError::SimulatedNetworkError(format!("{:?}", e)))?,
-        );
 
         let nodes = ln_node_from_graph(simulation_graph.clone(), routing_graph).await;
 
