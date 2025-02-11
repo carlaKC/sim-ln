@@ -86,7 +86,7 @@ pub struct Cli {
     #[clap(long, short)]
     pub fix_seed: Option<u64>,
     /// Speedup multiplier for wall clock when running in simulated network mode.
-    #[clap(long, short)]
+    #[clap(long)]
     pub clock_speedup: Option<u32>,
     /// Latency to optionally introduce for simulated nodes.
     #[clap(long)]
