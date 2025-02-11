@@ -953,7 +953,8 @@ pub async fn ln_node_from_graph<'a>(
     graph: Arc<Mutex<SimGraph>>,
     routing_graph: Arc<NetworkGraph<&'a WrappedLog>>,
 ) -> HashMap<PublicKey, Arc<Mutex<dyn LightningNode + '_>>> {
-    let mut nodes: HashMap<PublicKey, Arc<Mutex<dyn LightningNode>>> = HashMap::new();
+    let mut nodes: HashMap<PublicKey, Arc<Mutex<dyn LightningNode>>> =
+        HashMap::with_capacity(graph.lock().await.nodes.len());
 
     for (pk, info) in graph.lock().await.nodes.iter() {
         // Channels that are forward-only should be handled by our simulated graph, but not surfaced for the simulator
