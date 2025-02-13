@@ -1348,7 +1348,7 @@ async fn produce_simulation_results(
 ) -> Result<(), SimulationError> {
     let mut set = tokio::task::JoinSet::new();
 
-    let result = loop {
+    let result = 'outer: loop {
         tokio::select! {
             biased;
             _ = listener.clone() => {
@@ -1388,6 +1388,16 @@ async fn produce_simulation_results(
                 }
             }
         }
+
+        // Do a best-effort attempt to clear out any completed tasks in the joinset before proceeding to process
+        // more results. This prevents the joinset from building up over time and never emptying out any completed
+        // tasks.
+        while let Some(res) = set.try_join_next() {
+            if let Err(e) = res {
+                log::error!("Error collecting joinset: {e}");
+                break 'outer Err(SimulationError::TaskError);
+            }
+        }
     };
 
     log::debug!("Simulation results producer exiting.");
@@ -1406,7 +1416,7 @@ async fn track_payment_result(
     payment: Payment,
     listener: Listener,
 ) -> Result<(), SimulationError> {
-    log::trace!("Payment result tracker starting.");
+	log::trace!("Payment result tracker starting.");
 
     let mut node = node.lock().await;
 
