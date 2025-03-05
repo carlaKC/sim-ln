@@ -1,5 +1,6 @@
 /target
 node_modules
+*.json
 activity-generator/releases/*
 .DS_Store
 /results

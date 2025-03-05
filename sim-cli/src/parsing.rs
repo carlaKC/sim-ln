@@ -35,7 +35,7 @@ pub const ACTIVITY_MULTIPLIER: f64 = 2.0;
 pub const DEFAULT_PRINT_BATCH_SIZE: u32 = 500;
 
 /// Default value for speeding up the clock when running on a simulated network.
-pub const DEFAULT_CLOCK_SPEEDUP: u32 = 1;
+pub const DEFAULT_CLOCK_SPEEDUP: u32 = 1000;
 
 /// Deserializes a f64 as long as it is positive and greater than 0.
 fn deserialize_f64_greater_than_zero(x: String) -> Result<f64, String> {
@@ -86,7 +86,7 @@ pub struct Cli {
     #[clap(long, short)]
     pub fix_seed: Option<u64>,
     /// Speedup multiplier for wall clock when running in simulated network mode.
-    #[clap(long, short)]
+    #[clap(long)]
     pub clock_speedup: Option<u32>,
     /// Latency to optionally introduce for simulated nodes.
     #[clap(long)]
