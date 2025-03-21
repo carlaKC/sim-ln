@@ -22,7 +22,7 @@ use std::{collections::HashMap, sync::Arc, time::SystemTime};
 use thiserror::Error;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Mutex;
-use tokio::{select, time, time::Duration};
+use tokio::{select, time, time::Duration, time::Instant, time::Sleep};
 use tokio_util::task::TaskTracker;
 use triggered::{Listener, Trigger};
 
@@ -785,7 +785,7 @@ impl<C: Clock + 'static> Simulation<C> {
                 .iter()
                 .map(|generator| generator.source_info.pubkey)
                 .collect(),
-            event_sender.clone(),
+            event_sender,
             &self.tasks,
         );
 
@@ -816,24 +816,16 @@ impl<C: Clock + 'static> Simulation<C> {
 
         // Start a task that will shutdown the simulation if the total_time is met.
         if let Some(total_time) = self.cfg.total_time {
-            let shutdown = self.shutdown_trigger.clone();
-            let listener = self.shutdown_listener.clone();
-            let clock = self.clock.clone();
+            let t = self.shutdown_trigger.clone();
+            let l = self.shutdown_listener.clone();
 
             self.tasks.spawn(async move {
-                select! {
-                    biased;
-                    _ = listener.clone() => {
-                        log::debug!("Timeout task exited on listener signal");
-                    }
-
-                    _ = clock.sleep(total_time) => {
-                        log::info!(
-                            "Simulation run for {}s. Shutting down.",
-                            total_time.as_secs()
-                        );
-                        shutdown.trigger()
-                    }
+                if time::timeout(total_time, l).await.is_err() {
+                    log::info!(
+                        "Simulation run for {}s. Shutting down.",
+                        total_time.as_secs()
+                    );
+                    t.trigger()
                 }
             });
         }
@@ -916,7 +908,6 @@ impl<C: Clock + 'static> Simulation<C> {
                 result_logger,
                 clock,
                 results_receiver,
-                listener,
                 csr_write_results,
             )
             .await
@@ -1054,8 +1045,7 @@ impl<C: Clock + 'static> Simulation<C> {
 
             // Generate a consumer for the receiving end of the channel. It takes the event receiver that it'll pull
             // events from and the results sender to report the events it has triggered for further monitoring.
-            // ce: consume event.
-            let ce_listener = self.shutdown_listener.clone();
+            // ce: consume event
             let ce_shutdown = self.shutdown_trigger.clone();
             let ce_output_sender = output_sender.clone();
             let ce_node = node.clone();
@@ -1063,9 +1053,7 @@ impl<C: Clock + 'static> Simulation<C> {
             tasks.spawn(async move {
                 let node_info = ce_node.lock().await.get_info().clone();
                 log::debug!("Starting events consumer for {}.", node_info);
-                if let Err(e) =
-                    consume_events(ce_node, clock, receiver, ce_output_sender, ce_listener).await
-                {
+                if let Err(e) = consume_events(ce_node, clock, receiver, ce_output_sender).await {
                     ce_shutdown.trigger();
                     log::error!("Event consumer for node {node_info} exited with error: {e:?}.");
                 } else {
@@ -1137,77 +1125,65 @@ async fn consume_events(
     clock: Arc<dyn Clock>,
     mut receiver: Receiver<SimulationEvent>,
     sender: Sender<SimulationOutput>,
-    listener: Listener,
 ) -> Result<(), SimulationError> {
     loop {
-        select! {
-            biased;
-            _ = listener.clone() => {
-                return Ok(());
-            },
-            simulation_event = receiver.recv() => {
-                if let Some(event) = simulation_event {
-                    match event {
-                        SimulationEvent::SendPayment(dest, amt_msat) => {
-                            let mut node = node.lock().await;
+        let simulation_event = receiver.recv().await;
+        if let Some(event) = simulation_event {
+            match event {
+                SimulationEvent::SendPayment(dest, amt_msat) => {
+                    let mut node = node.lock().await;
 
-                            let mut payment = Payment {
-                                source: node.get_info().pubkey,
-                                hash: None,
-                                amount_msat: amt_msat,
-                                destination: dest.pubkey,
-                                dispatch_time: clock.now(),
-                            };
+                    let mut payment = Payment {
+                        source: node.get_info().pubkey,
+                        hash: None,
+                        amount_msat: amt_msat,
+                        destination: dest.pubkey,
+                        dispatch_time: clock.now(),
+                    };
 
-                            let outcome = match node.send_payment(dest.pubkey, amt_msat).await {
-                                Ok(payment_hash) => {
-                                    log::debug!(
-                                        "Send payment: {} -> {}: ({}).",
-                                        node.get_info(),
-                                        dest,
-                                        hex::encode(payment_hash.0)
-                                    );
-                                    // We need to track the payment outcome using the payment hash that we have received.
-                                    payment.hash = Some(payment_hash);
-                                    SimulationOutput::SendPaymentSuccess(payment)
-                                }
-                                Err(e) => {
-                                    log::error!(
-                                        "Error while sending payment {} -> {}.",
-                                        node.get_info(),
-                                        dest
-                                    );
+                    let outcome = match node.send_payment(dest.pubkey, amt_msat).await {
+                        Ok(payment_hash) => {
+                            log::debug!(
+                                "Send payment: {} -> {}: ({}).",
+                                node.get_info(),
+                                dest,
+                                hex::encode(payment_hash.0)
+                            );
+                            // We need to track the payment outcome using the payment hash that we have received.
+                            payment.hash = Some(payment_hash);
+                            SimulationOutput::SendPaymentSuccess(payment)
+                        },
+                        Err(e) => {
+                            log::error!(
+                                "Error while sending payment {} -> {}.",
+                                node.get_info(),
+                                dest
+                            );
 
-                                    match e {
-                                        LightningError::PermanentError(s) => {
-                                            return Err(SimulationError::LightningError(LightningError::PermanentError(s)));
-                                        }
-                                        _ => SimulationOutput::SendPaymentFailure(
-                                            payment,
-                                            PaymentResult::not_dispatched(),
-                                        ),
-                                    }
-                                }
-                            };
-
-                            select!{
-                                biased;
-                                _ = listener.clone() => {
-                                    return Ok(())
-                                }
-                                send_result = sender.send(outcome.clone()) => {
-                                    if send_result.is_err() {
-                                        return Err(SimulationError::MpscChannelError(
-                                                format!("Error sending simulation output {outcome:?}.")));
-                                    }
-                                }
+                            match e {
+                                LightningError::PermanentError(s) => {
+                                    return Err(SimulationError::LightningError(
+                                        LightningError::PermanentError(s),
+                                    ));
+                                },
+                                _ => SimulationOutput::SendPaymentFailure(
+                                    payment,
+                                    PaymentResult::not_dispatched(),
+                                ),
                             }
-                        }
+                        },
+                    };
+
+                    let send_result = sender.send(outcome.clone()).await;
+                    if send_result.is_err() {
+                        return Err(SimulationError::MpscChannelError(format!(
+                            "Error sending simulation output {outcome:?}."
+                        )));
                     }
-                } else {
-                    return Ok(())
-                }
+                },
             }
+        } else {
+            return Ok(());
         }
     }
 }
@@ -1320,7 +1296,6 @@ async fn consume_simulation_results(
     logger: Arc<Mutex<PaymentResultLogger>>,
     clock: Arc<dyn Clock>,
     mut receiver: Receiver<(Payment, PaymentResult)>,
-    listener: Listener,
     write_results: Option<WriteResults>,
 ) -> Result<(), SimulationError> {
     let mut writer = None;
@@ -1338,24 +1313,17 @@ async fn consume_simulation_results(
     }
 
     loop {
-        select! {
-            biased;
-            _ = listener.clone() => {
-                return writer.map_or(Ok(()), |mut w| w.write(true));
-            },
-            payment_result = receiver.recv() => {
-                match payment_result {
-                    Some((details, result)) => {
-                        logger.lock().await.report_result(&details, &result);
-                        log::trace!("Resolved dispatched payment: {} with: {}.", details, result);
+        let payment_result = receiver.recv().await;
+        match payment_result {
+            Some((details, result)) => {
+                logger.lock().await.report_result(&details, &result);
+                log::trace!("Resolved dispatched payment: {} with: {}.", details, result);
 
-                        if let Some(ref mut w) = writer{
-                            w.queue((details, result))?;
-                        }
-                    },
-                    None => return writer.map_or(Ok(()), |mut w| w.write(true)),
+                if let Some(ref mut w) = writer {
+                    w.queue((details, result))?;
                 }
-            }
+            },
+            None => return writer.map_or(Ok(()), |mut w| w.write(true)),
         }
     }
 }
@@ -1437,8 +1405,7 @@ async fn run_results_logger(
 ///
 /// Note: this producer does not accept a shutdown trigger because it only expects to be dispatched once. In the single
 /// producer case exit will drop the only sending channel and the receiving channel provided to the consumer will error
-/// out. In the multiple-producer case, a single producer shutting down does not drop *all* sending channels so the
-/// consumer will not exit and a trigger is required.
+/// out.
 async fn produce_simulation_results(
     nodes: HashMap<PublicKey, Arc<Mutex<dyn LightningNode>>>,
     mut output_receiver: Receiver<SimulationOutput>,
@@ -1447,44 +1414,37 @@ async fn produce_simulation_results(
     tasks: &TaskTracker,
 ) -> Result<(), SimulationError> {
     let result = loop {
-        tokio::select! {
-            biased;
-            _ = listener.clone() => {
-                break Ok(())
-            },
-            output = output_receiver.recv() => {
-                match output {
-                    Some(simulation_output) => {
-                        match simulation_output{
-                            SimulationOutput::SendPaymentSuccess(payment) => {
-                                if let Some(source_node) = nodes.get(&payment.source) {
-                                    tasks.spawn(track_payment_result(
-                                        source_node.clone(), results.clone(), payment, listener.clone()
-                                    ));
-                                } else {
-                                    break Err(SimulationError::MissingNodeError(format!("Source node with public key: {} unavailable.", payment.source)));
-                                }
-                            },
-                            SimulationOutput::SendPaymentFailure(payment, result) => {
-                                select!{
-                                    _ = listener.clone() => {
-                                        return Ok(());
-                                    },
-                                    send_result = results.send((payment, result.clone())) => {
-                                        if send_result.is_err(){
-                                            break Err(SimulationError::MpscChannelError(
-                                                format!("Failed to send payment result: {result} for payment {:?} dispatched at {:?}.",
-                                                        payment.hash, payment.dispatch_time),
-                                            ));
-                                        }
-                                    },
-                                }
-                            }
-                        };
+        let output = output_receiver.recv().await;
+        match output {
+            Some(simulation_output) => {
+                match simulation_output {
+                    SimulationOutput::SendPaymentSuccess(payment) => {
+                        if let Some(source_node) = nodes.get(&payment.source) {
+                            tasks.spawn(track_payment_result(
+                                source_node.clone(),
+                                results.clone(),
+                                payment,
+                                listener.clone(),
+                            ));
+                        } else {
+                            break Err(SimulationError::MissingNodeError(format!(
+                                "Source node with public key: {} unavailable.",
+                                payment.source
+                            )));
+                        }
                     },
-                    None => break Ok(())
-                }
-            }
+                    SimulationOutput::SendPaymentFailure(payment, result) => {
+                        let send_result = results.send((payment, result.clone())).await;
+                        if send_result.is_err() {
+                            break Err(SimulationError::MpscChannelError(
+                                format!("Failed to send payment result: {result} for payment {:?} dispatched at {:?}.",
+                                    payment.hash, payment.dispatch_time),
+                            ));
+                        }
+                    },
+                };
+            },
+            None => break Ok(()),
         }
     };
 
@@ -1506,21 +1466,46 @@ async fn track_payment_result(
     let res = match payment.hash {
         Some(hash) => {
             log::debug!("Tracking payment outcome for: {}.", hex::encode(hash.0));
-            let track_payment = node.track_payment(&hash, listener.clone());
 
-            match track_payment.await {
-                Ok(res) => {
-                    log::debug!(
-                        "Track payment {} result: {:?}.",
-                        hex::encode(hash.0),
-                        res.payment_outcome
-                    );
-                    res
-                },
-                Err(e) => {
-                    log::error!("Track payment failed for {}: {e}.", hex::encode(hash.0));
-                    PaymentResult::track_payment_failed()
-                },
+            // Trigger and listener to stop the implementation specific track payment functions (node.track_payment())
+            let (track_payment_trigger, track_payment_listener) = triggered::trigger();
+
+            // Timer for waiting after getting the shutdown signal in order for current tracking to complete
+            let mut timer: Option<Sleep> = None;
+            let mut timer_started = false;
+
+            loop {
+                tokio::select! {
+                    // The shutdown listener is triggered and we have not started a timer yet
+                    _ = async {}, if listener.clone().is_triggered() && !timer_started => {
+                        log::debug!("Shutdown received by track_payment_result, starting timer...");
+                        timer = Some(time::sleep_until(Instant::now() + Duration::from_secs(3)));
+                        timer_started = true;
+                    },
+                    // The timer has been started and it expires
+                    Some(_) = conditional_sleeper(timer) => {
+                        log::error!("Track payment failed for {}. The shutdown timer expired.", hex::encode(hash.0));
+                        track_payment_trigger.trigger();
+                        timer = None;
+                    }
+                    // The payment tracking completes
+                    res = node.track_payment(&hash, track_payment_listener.clone()) => {
+                        match res {
+                            Ok(res) => {
+                                log::info!(
+                                    "Track payment {} result: {:?}.",
+                                    hex::encode(hash.0),
+                                    res.payment_outcome
+                                );
+                                break res;
+                            },
+                            Err(e) => {
+                                log::error!("Track payment failed for {}: {e}.", hex::encode(hash.0));
+                                break PaymentResult::track_payment_failed();
+                            },
+                        }
+                    }
+                }
             }
         },
         // None means that the payment was not dispatched, so we cannot track it.
@@ -1532,22 +1517,26 @@ async fn track_payment_result(
         },
     };
 
-    select! {
-        biased;
-        _ = listener.clone() => {
-            log::debug!("Track payment result received a shutdown signal.");
-        },
-        send_payment_result = results.send((payment, res.clone())) => {
-            if send_payment_result.is_err() {
-                return Err(SimulationError::MpscChannelError(
-                        format!("Failed to send payment result {res} for payment {payment}.")))
-            }
-        }
+    let send_payment_result = results.send((payment, res.clone())).await;
+    if send_payment_result.is_err() {
+        return Err(SimulationError::MpscChannelError(format!(
+            "Failed to send payment result {res} for payment {payment}."
+        )));
     }
 
     log::trace!("Result tracking complete. Payment result tracker exiting.");
 
     Ok(())
+}
+
+async fn conditional_sleeper(t: Option<Sleep>) -> Option<()> {
+    match t {
+        Some(timer) => {
+            timer.await;
+            Some(())
+        },
+        None => None,
+    }
 }
 
 #[cfg(test)]
