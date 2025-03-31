@@ -618,8 +618,8 @@ impl Simulation {
     /// before returning.
     pub async fn run(&self) -> Result<(), SimulationError> {
         self.internal_run().await?;
-        // Close our TaskTracker and wait for any background tasks
-        // spawned during internal_run to complete.
+        // Close our TaskTracker and wait for any background tasks spawned during internal_run to 
+		// complete.
         self.tasks.close();
         self.tasks.wait().await;
         Ok(())
@@ -1015,6 +1015,7 @@ async fn consume_events(
                                 dispatch_time: SystemTime::now(),
                             };
 
+							println!("CKC sending payment");
                             let outcome = match node.send_payment(dest.pubkey, amt_msat).await {
                                 Ok(payment_hash) => {
                                     log::debug!(
@@ -1418,11 +1419,15 @@ async fn track_payment_result(
 #[cfg(test)]
 mod tests {
     use crate::{
-        get_payment_delay, test_utils, LightningError, LightningNode, MutRng, NodeInfo,
-        PaymentGenerationError, PaymentGenerator, Simulation,
+        get_payment_delay, test_utils, ActivityDefinition, LightningError, LightningNode, MutRng,
+        NodeInfo, PaymentGenerationError, PaymentGenerator, PaymentOutcome, PaymentResult,
+        Simulation, ValueOrRange,
     };
     use async_trait::async_trait;
     use bitcoin::secp256k1::PublicKey;
+    use bitcoin::Network;
+    use lightning::ln::features::NodeFeatures;
+    use lightning::ln::PaymentHash;
     use mockall::mock;
     use std::collections::HashMap;
     use std::fmt;
@@ -1576,5 +1581,111 @@ mod tests {
             TaskTracker::new(),
         );
         assert!(simulation.validate_activity().await.is_err());
+    }
+
+    async fn test_run_simulation(
+        set_activity: impl FnOnce(
+            &mut MockLightningNode,
+            &mut MockLightningNode,
+        ) -> Vec<ActivityDefinition>,
+    ) {
+        let nodes = test_utils::create_nodes(2, 100_000);
+
+        let node_1 = nodes.first().unwrap().0.clone();
+        let node_2 = nodes.get(1).unwrap().0.clone();
+
+        let mut mock_node_1 = MockLightningNode::new();
+        let mut mock_node_2 = MockLightningNode::new();
+
+        // Validation will call get_network on both nodes.
+        mock_node_1
+            .expect_get_network()
+            .returning(|| Ok(Network::Regtest));
+        mock_node_2
+            .expect_get_network()
+            .returning(|| Ok(Network::Regtest));
+
+        // Dispatch of consumers will call get_info on both nodes.
+        let mut features = NodeFeatures::empty();
+        features.set_keysend_optional();
+
+        mock_node_1.expect_get_info().return_const(NodeInfo {
+            pubkey: node_1.pubkey,
+            alias: "node_1".to_string(),
+            features: features.clone(),
+        });
+
+        mock_node_2.expect_get_info().return_const(NodeInfo {
+            pubkey: node_2.pubkey,
+            alias: "node_2".to_string(),
+            features,
+        });
+
+        let activity_definition = set_activity(&mut mock_node_1, &mut mock_node_2);
+
+        let mut clients: HashMap<PublicKey, Arc<Mutex<dyn LightningNode>>> = HashMap::new();
+        clients.insert(node_1.pubkey, Arc::new(Mutex::new(mock_node_1)));
+        clients.insert(node_2.pubkey, Arc::new(Mutex::new(mock_node_2)));
+
+        let tasks = TaskTracker::new();
+        let simulation = Simulation::new(
+            crate::SimulationCfg::new(None, 0, 0.0, None, None),
+            clients,
+            activity_definition,
+            tasks.clone(),
+        );
+        assert!(simulation.validate_activity().await.is_ok());
+
+        let res = simulation.run().await;
+        assert!(res.is_ok(), "expected clean exit, got: {:?}", res.err());
+
+		drop(simulation);
+		mock_node_1.checkpoint();
+		mock_node_2.checkpoint();
+    }
+
+    #[tokio::test]
+    async fn test_producers_finished() {
+        test_run_simulation(
+            |node_1: &mut MockLightningNode,
+             node_2: &mut MockLightningNode|
+             -> Vec<ActivityDefinition> {
+                let node_1_info = node_1.get_info().clone();
+                let node_2_info = node_2.get_info().clone();
+
+                let node_2_pubkey = node_2_info.pubkey;
+                let payment_hash = PaymentHash([0; 32]);
+
+                // We're sending one payment from node_1 -> node_2 so we expect mock calls for its
+                // dispatch and tracking.
+                node_1
+                    .expect_send_payment()
+                    .return_once(move |pubkey, amt| { // TODO: these assertions can be done using .with
+                        assert!(pubkey == node_2_pubkey);
+                        assert!(amt == 100);
+
+                        Ok(payment_hash)
+                    });
+
+                node_1.expect_track_payment().return_once(move |hash, _| {
+                    assert!(*hash == payment_hash);
+
+                    Ok(PaymentResult {
+                        htlc_count: 1,
+                        payment_outcome: PaymentOutcome::Success,
+                    })
+                });
+
+				vec![ActivityDefinition {
+                    source: node_1_info,
+                    destination: node_2_info,
+                    start_secs: None,
+                    count: Some(1),
+                    interval_secs: ValueOrRange::Value(1),
+                    amount_msat: ValueOrRange::Value(100),
+                }]
+            },
+        )
+        .await;
     }
 }
