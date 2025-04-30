@@ -15,9 +15,7 @@ use lightning::ln::msgs::{
 };
 use lightning::ln::{PaymentHash, PaymentPreimage};
 use lightning::routing::gossip::{NetworkGraph, NodeId};
-use lightning::routing::router::{
-    find_route, Path, PaymentParameters, Route, RouteHop, RouteParameters,
-};
+use lightning::routing::router::{find_route, Path, PaymentParameters, Route, RouteParameters};
 use lightning::routing::scoring::ProbabilisticScorer;
 use lightning::routing::utxo::{UtxoLookup, UtxoResult};
 use lightning::util::logger::{Level, Logger, Record};
@@ -255,7 +253,7 @@ impl ChannelState {
     /// reported.
     fn add_outgoing_htlc(&mut self, hash: PaymentHash, htlc: Htlc) -> Result<u64, ForwardingError> {
         self.check_outgoing_addition(&htlc)?;
-        if self.in_flight.get(&hash).is_some() {
+        if self.in_flight.contains_key(&hash) {
             return Err(ForwardingError::PaymentHashExists(hash));
         }
         let index = self.index;
@@ -774,34 +772,6 @@ pub struct InterceptRequest {
     >,
 }
 
-impl InterceptRequest {
-    fn new(
-        hop: RouteHop,
-        payment_hash: PaymentHash,
-        incoming_amount_msat: u64,
-        incoming_htlc: HtlcRef,
-        incoming_custom_records: CustomRecords,
-        outgoing_channel_id: Option<ShortChannelID>,
-        incoming_expiry_height: u32,
-        response: tokio::sync::mpsc::Sender<
-            Result<Result<CustomRecords, ForwardingError>, Box<dyn Error + Send + Sync + 'static>>,
-        >,
-    ) -> Self {
-        Self {
-            forwarding_node: hop.pubkey,
-            payment_hash,
-            outgoing_channel_id,
-            incoming_amount_msat,
-            incoming_htlc,
-            incoming_custom_records,
-            outgoing_amount_msat: incoming_amount_msat - hop.fee_msat,
-            incoming_expiry_height,
-            outgoing_expiry_height: incoming_expiry_height - hop.cltv_expiry_delta,
-            response,
-        }
-    }
-}
-
 impl Display for InterceptRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -848,6 +818,9 @@ pub struct SimGraph {
     /// Optional writer to flush htlc forwards to disk.
     writer: Option<Arc<Mutex<BatchedWriter>>>,
 
+    /// Custom records that will be added to the first outgoing HTLC in a payment.
+    default_custom_records: CustomRecords,
+
     /// Optional set of interceptors that will be called every time a HTLC is added to a simulated channel. Given
     /// a route A -- B -- C, events will happen in the following order:
     ///
@@ -866,6 +839,7 @@ impl SimGraph {
         graph_channels: Vec<SimulatedChannel>,
         clock: Arc<dyn Clock>,
         write_results: Option<WriteResults>,
+        default_custom_records: CustomRecords,
         interceptors: Vec<Arc<dyn Interceptor>>,
         shutdown_listener: Listener,
         shutdown_trigger: Trigger,
@@ -919,6 +893,7 @@ impl SimGraph {
             channels: Arc::new(Mutex::new(channels)),
             clock,
             writer,
+            default_custom_records,
             tasks: JoinSet::new(),
             interceptors,
             shutdown_listener,
@@ -1077,6 +1052,7 @@ impl SimNetwork for SimGraph {
             source,
             route: path.clone(),
             payment_hash,
+            custom_records: self.default_custom_records.clone(),
             interceptors: self.interceptors.clone(),
             listener: self.shutdown_listener.clone(),
             sender,
@@ -1117,6 +1093,17 @@ impl SimNetwork for SimGraph {
     }
 }
 
+struct AddHtlcsRequest {
+    nodes: Arc<Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
+    source: PublicKey,
+    route: Path,
+    payment_hash: PaymentHash,
+    clock: Arc<dyn Clock>,
+    custom_records: CustomRecords,
+    interceptors: Vec<Arc<dyn Interceptor>>,
+    listener: Listener,
+}
+
 /// Adds htlcs to the simulation state along the path provided. Returning the index in the path from which to fail
 /// back htlcs (if any) and a forwarding error if the payment is not successfully added to the entire path.
 ///
@@ -1134,21 +1121,13 @@ impl SimNetwork for SimGraph {
 /// Note that we don't have any special handling for the receiving node, once we've successfully added a outgoing HTLC
 /// for the outgoing channel that is connected to the receiving node we'll return. To add invoice-related handling,
 /// we'd need to include some logic that then decides whether to settle/fail the HTLC at the last hop here.
-async fn add_htlcs(
-    nodes: Arc<Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
-    source: PublicKey,
-    route: Path,
-    payment_hash: PaymentHash,
-    clock: Arc<dyn Clock>,
-    interceptors: Vec<Arc<dyn Interceptor>>,
-    listener: Listener,
-) -> Result<(), (Option<usize>, ForwardingError)> {
-    let mut outgoing_node = source;
+async fn add_htlcs(request: AddHtlcsRequest) -> Result<(), (Option<usize>, ForwardingError)> {
+    let mut outgoing_node = request.source;
+    let route = request.route;
     let mut outgoing_amount = route.fee_msat() + route.final_value_msat();
     let mut outgoing_cltv = route.hops.iter().map(|hop| hop.cltv_expiry_delta).sum();
 
-    // Start with no custom records on the htlc (we don't have the ability to set them at the moment
-    let mut incoming_custom_records = HashMap::new();
+    let mut incoming_custom_records = request.custom_records;
 
     // Tracks the hop index that we need to remove htlcs from on payment completion (both success and failure).
     // Given a payment from A to C, over the route A -- B -- C, this index has the following meanings:
@@ -1161,7 +1140,7 @@ async fn add_htlcs(
         // Lock the node that we want to add the HTLC to next. We choose to lock one hop at a time (rather than for
         // the whole route) so that we can mimic the behavior of payments in the real network where the HTLCs in a
         // route don't all get to lock in in a row (they have interactions with other payments).
-        let mut node_lock = nodes.lock().await;
+        let mut node_lock = request.nodes.lock().await;
         let scid = ShortChannelID::from(hop.short_channel_id);
 
         let (incoming_htlc, next_scid) = {
@@ -1169,11 +1148,11 @@ async fn add_htlcs(
                 let htlc_index = channel
                 .add_htlc(
                     &outgoing_node,
-                    payment_hash,
+                    request.payment_hash,
                     Htlc {
                         amount_msat: outgoing_amount,
                         cltv_expiry: outgoing_cltv,
-                        add_ts: clock.now(),
+                        add_ts: request.clock.now(),
                         remove_ts: None,
                     },
                 )
@@ -1232,22 +1211,21 @@ async fn add_htlcs(
         // incoming_custom_records for this purpose, but we keep it simple for now.
         let mut outgoing_custom_records: HashMap<u64, Vec<u8>> = HashMap::new();
 
-        if !interceptors.is_empty() {
-            let (sender, mut receiver) = tokio::sync::mpsc::channel(interceptors.len());
-            for interceptor in interceptors.iter() {
-                let request = InterceptRequest::new(
-                    hop.clone(),
-                    payment_hash,
-                    // We've just added the outgoing amount to the sending node, and we're notifying the forward to its
-                    // peer that has just received an incoming htlc, so the outgoing amount added to the sending node
-                    // is the incoming amount for the forwarding node.
-                    outgoing_amount,
-                    incoming_htlc.clone(),
-                    incoming_custom_records.clone(),
-                    next_scid,
-                    outgoing_cltv,
-                    sender.clone(),
-                );
+        if !request.interceptors.is_empty() {
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(request.interceptors.len());
+            for interceptor in request.interceptors.iter() {
+                let request = InterceptRequest {
+                    forwarding_node: hop.pubkey,
+                    payment_hash: request.payment_hash,
+                    incoming_htlc: incoming_htlc.clone(),
+                    incoming_custom_records: incoming_custom_records.clone(),
+                    outgoing_channel_id: next_scid,
+                    incoming_amount_msat: outgoing_amount,
+                    outgoing_amount_msat: outgoing_amount - hop.fee_msat,
+                    incoming_expiry_height: outgoing_cltv,
+                    outgoing_expiry_height: outgoing_cltv - hop.cltv_expiry_delta,
+                    response: sender.clone(),
+                };
 
                 log::trace!(
                     "Sending HTLC to intercepor: {} {request}",
@@ -1260,12 +1238,12 @@ async fn add_htlcs(
             // the HTLC. Once we get a terminal signal (a shutdown or HTLC failure), we'll close the receiving channel
             // and drain any remaining messages to ensure that we do not block any callers.
             let mut interceptor_failure = None;
-            'get_resp: for i in 0..interceptors.len() {
+            'get_resp: for i in 0..request.interceptors.len() {
                 log::trace!("Waiting for interceptor: {i}");
 
                 select! {
                 biased;
-                _ = listener.clone() => {
+                _ = request.listener.clone() => {
                     receiver.close();
                 },
                 resp = receiver.recv() =>{
@@ -1318,6 +1296,17 @@ async fn add_htlcs(
     Ok(())
 }
 
+struct RemoveHtlcsRequest {
+    nodes: Arc<Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
+    resolution_idx: usize,
+    source: PublicKey,
+    route: Path,
+    payment_hash: PaymentHash,
+    success: bool,
+    clock: Arc<dyn Clock>,
+    interceptors: Vec<Arc<dyn Interceptor>>,
+}
+
 /// Removes htlcs from the simulation state from the index in the path provided (backwards).
 ///
 /// Taking the example of a payment over A --> B --> C --> D where the payment was rejected by C because it did not
@@ -1327,37 +1316,35 @@ async fn add_htlcs(
 /// This function will remove the HTLC one hop at a time, working backwards from the failure index, so in this
 /// case B --> C and then B --> A. We lookup the HTLC on the incoming node because it will have tracked it in its
 /// outgoing in-flight HTLCs.
-async fn remove_htlcs(
-    nodes: Arc<Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
-    resolution_idx: usize,
-    source: PublicKey,
-    route: Path,
-    payment_hash: PaymentHash,
-    success: bool,
-    clock: Arc<dyn Clock>,
-    interceptors: Vec<Arc<dyn Interceptor>>,
-) -> Result<Vec<Htlc>, ForwardingError> {
+async fn remove_htlcs(request: RemoveHtlcsRequest) -> Result<Vec<Htlc>, ForwardingError> {
     let mut route_htlcs: Vec<Htlc> = vec![];
 
     let mut outgoing_channel_id = None;
-    for (i, hop) in route.hops[0..=resolution_idx].iter().enumerate().rev() {
+    for (i, hop) in request.route.hops[0..=request.resolution_idx]
+        .iter()
+        .enumerate()
+        .rev()
+    {
         // When we add HTLCs, we do so on the state of the node that sent the htlc along the channel so we need to
         // look up our incoming node so that we can remove it when we go backwards. For the first htlc, this is just
         // the sending node, otherwise it's the hop before.
         let incoming_node = if i == 0 {
-            source
+            request.source
         } else {
-            route.hops[i - 1].pubkey
+            request.route.hops[i - 1].pubkey
         };
 
         // As with when we add HTLCs, we remove them one hop at a time (rather than locking for the whole route) to
         // mimic the behavior of payments in a real network.
-        let mut node_lock = nodes.lock().await;
+        let mut node_lock = request.nodes.lock().await;
         let incoming_scid = ShortChannelID::from(hop.short_channel_id);
         let (removed_htlc, index) = match node_lock.get_mut(&incoming_scid) {
-            Some(channel) => {
-                channel.remove_htlc(&incoming_node, &payment_hash, success, clock.now())?
-            },
+            Some(channel) => channel.remove_htlc(
+                &incoming_node,
+                &request.payment_hash,
+                request.success,
+                request.clock.now(),
+            )?,
             None => {
                 return Err(ForwardingError::ChannelNotFound(ShortChannelID::from(
                     hop.short_channel_id,
@@ -1371,7 +1358,7 @@ async fn remove_htlcs(
         // We drop our node lock so that we can notify interceptors without blocking other payments processing.
         drop(node_lock);
 
-        for interceptor in interceptors.iter() {
+        for interceptor in request.interceptors.iter() {
             log::trace!("Sending resolution to interceptor: {}", interceptor.name());
 
             interceptor
@@ -1382,7 +1369,7 @@ async fn remove_htlcs(
                         index,
                     },
                     outgoing_channel_id,
-                    success,
+                    success: request.success,
                 })
                 .await
                 .map_err(ForwardingError::NotifierError)?;
@@ -1402,6 +1389,7 @@ struct PropagatePaymentRequest {
     sender: Sender<Result<PaymentResult, LightningError>>,
     writer: Option<Arc<Mutex<BatchedWriter>>>,
     clock: Arc<dyn Clock>,
+    custom_records: CustomRecords,
     interceptors: Vec<Arc<dyn Interceptor>>,
     listener: Listener,
     shutdown: Trigger,
@@ -1414,15 +1402,16 @@ struct PropagatePaymentRequest {
 async fn propagate_payment(request: PropagatePaymentRequest) {
     // If we partially added HTLCs along the route, we need to fail them back to the source to clean up our partial
     // state. It's possible that we failed with the very first add, and then we don't need to clean anything up.
-    let notify_result = if let Err((fail_idx, err)) = add_htlcs(
-        request.nodes.clone(),
-        request.source,
-        request.route.clone(),
-        request.payment_hash,
-        request.clock.clone(),
-        request.interceptors.clone(),
-        request.listener,
-    )
+    let notify_result = if let Err((fail_idx, err)) = add_htlcs(AddHtlcsRequest {
+        nodes: request.nodes.clone(),
+        source: request.source,
+        route: request.route.clone(),
+        payment_hash: request.payment_hash,
+        clock: request.clock.clone(),
+        custom_records: request.custom_records,
+        interceptors: request.interceptors.clone(),
+        listener: request.listener,
+    })
     .await
     {
         if err.is_critical() {
@@ -1430,16 +1419,16 @@ async fn propagate_payment(request: PropagatePaymentRequest) {
         }
 
         if let Some(resolution_idx) = fail_idx {
-            if let Err(e) = remove_htlcs(
-                request.nodes,
+            if let Err(e) = remove_htlcs(RemoveHtlcsRequest {
+                nodes: request.nodes,
                 resolution_idx,
-                request.source,
-                request.route,
-                request.payment_hash,
-                false,
-                request.clock.clone(),
-                request.interceptors.clone(),
-            )
+                source: request.source,
+                route: request.route,
+                payment_hash: request.payment_hash,
+                success: false,
+                clock: request.clock,
+                interceptors: request.interceptors.clone(),
+            })
             .await
             {
                 if e.is_critical() {
@@ -1461,16 +1450,16 @@ async fn propagate_payment(request: PropagatePaymentRequest) {
         }
     } else {
         // If we successfully added the htlc, go ahead and remove all the htlcs in the route with successful resolution.
-        match remove_htlcs(
-            request.nodes.clone(),
-            request.route.hops.len() - 1,
-            request.source,
-            request.route.clone(),
-            request.payment_hash,
-            true,
-            request.clock.clone(),
-            request.interceptors,
-        )
+        match remove_htlcs(RemoveHtlcsRequest {
+            nodes: request.nodes.clone(),
+            resolution_idx: request.route.hops.len() - 1,
+            source: request.source,
+            route: request.route.clone(),
+            payment_hash: request.payment_hash,
+            success: true,
+            clock: request.clock,
+            interceptors: request.interceptors.clone(),
+        })
         .await
         {
             // If we successfully removed the htlcs, we can write the forwarding results to
@@ -1637,7 +1626,7 @@ mod tests {
     use lightning::routing::router::Route;
     use mockall::mock;
     use std::time::Duration;
-    use tokio::sync::oneshot;
+    use tokio::sync::{mpsc, oneshot};
     use tokio::time::timeout;
 
     /// Creates a test channel policy with its maximum HTLC size set to half of the in flight limit of the channel.
@@ -2123,6 +2112,21 @@ mod tests {
         ));
     }
 
+    mock! {
+        #[derive(Debug)]
+        TestInterceptor{}
+
+        #[async_trait]
+        impl Interceptor for TestInterceptor {
+            async fn intercept_htlc(&self, req: InterceptRequest);
+            async fn notify_resolution(
+                &self,
+                res: InterceptResolution,
+            ) -> Result<(), Box<dyn Error + Send + Sync + 'static>>;
+            fn name(&self) -> String;
+        }
+    }
+
     /// Contains elements required to test dispatch_payment functionality.
     struct DispatchPaymentTestKit<'a> {
         graph: SimGraph,
@@ -2138,7 +2142,11 @@ mod tests {
         /// Alice (100) --- (0) Bob (100) --- (0) Carol (100) --- (0) Dave
         ///
         /// The nodes pubkeys in this chain of channels are provided in-order for easy access.
-        async fn new(capacity: u64) -> Self {
+        async fn new(
+            capacity: u64,
+            custom_records: CustomRecords,
+            interceptors: Vec<Arc<dyn Interceptor>>,
+        ) -> Self {
             let (shutdown, listener) = triggered::trigger();
             let channels = create_simulated_channels(3, capacity);
 
@@ -2156,7 +2164,8 @@ mod tests {
                     channels.clone(),
                     clock.clone(),
                     None,
-                    vec![],
+                    custom_records,
+                    interceptors,
                     listener.clone(),
                     shutdown.clone(),
                 )
@@ -2235,7 +2244,8 @@ mod tests {
     #[tokio::test]
     async fn test_successful_dispatch() {
         let chan_capacity = 500_000_000;
-        let mut test_kit = DispatchPaymentTestKit::new(chan_capacity).await;
+        let mut test_kit =
+            DispatchPaymentTestKit::new(chan_capacity, CustomRecords::default(), vec![]).await;
 
         // Send a payment that should succeed from Alice -> Dave.
         let mut amt = 20_000;
@@ -2299,7 +2309,8 @@ mod tests {
     #[tokio::test]
     async fn test_successful_multi_hop() {
         let chan_capacity = 500_000_000;
-        let mut test_kit = DispatchPaymentTestKit::new(chan_capacity).await;
+        let mut test_kit =
+            DispatchPaymentTestKit::new(chan_capacity, CustomRecords::default(), vec![]).await;
 
         // Send a payment that should succeed from Alice -> Dave.
         let amt = 20_000;
@@ -2328,7 +2339,8 @@ mod tests {
     #[tokio::test]
     async fn test_single_hop_payments() {
         let chan_capacity = 500_000_000;
-        let mut test_kit = DispatchPaymentTestKit::new(chan_capacity).await;
+        let mut test_kit =
+            DispatchPaymentTestKit::new(chan_capacity, CustomRecords::default(), vec![]).await;
 
         // Send a single hop payment from Alice -> Bob, it will succeed because Alice has all the liquidity.
         let amt = 150_000;
@@ -2359,7 +2371,8 @@ mod tests {
     #[tokio::test]
     async fn test_multi_hop_faiulre() {
         let chan_capacity = 500_000_000;
-        let mut test_kit = DispatchPaymentTestKit::new(chan_capacity).await;
+        let mut test_kit =
+            DispatchPaymentTestKit::new(chan_capacity, CustomRecords::default(), vec![]).await;
 
         // Drain liquidity between Bob and Carol to force failures on Bob's outgoing linke.
         test_kit
@@ -2393,5 +2406,117 @@ mod tests {
 
         test_kit.shutdown.trigger();
         test_kit.graph.wait_for_shutdown().await;
+    }
+
+    /// Tests custom records set in a single-hop intercepted htlc.
+    #[tokio::test]
+    async fn test_single_hop_custom_records() {
+        let custom_records = HashMap::from([(1000, vec![1])]);
+        let mut mock_interceptor = MockTestInterceptor::new();
+
+        let (sender, mut receiver) = mpsc::channel::<CustomRecords>(1);
+        mock_interceptor
+            .expect_intercept_htlc()
+            .returning(move |req: InterceptRequest| {
+                let sender = sender.clone();
+                tokio::spawn(async move {
+                    let response_sender = req.response;
+                    response_sender
+                        .send(Ok(Ok(req.incoming_custom_records.clone())))
+                        .await
+                        .unwrap();
+
+                    sender
+                        .send(req.incoming_custom_records.clone())
+                        .await
+                        .unwrap();
+                });
+            });
+        mock_interceptor
+            .expect_notify_resolution()
+            .returning(|_| Ok(()));
+
+        let chan_capacity = 500_000_000;
+        let mut test_kit = DispatchPaymentTestKit::new(
+            chan_capacity,
+            custom_records.clone(),
+            vec![Arc::new(mock_interceptor)],
+        )
+        .await;
+
+        let amt = 150_000;
+        let _ = test_kit
+            .send_test_payemnt(test_kit.nodes[0], test_kit.nodes[1], amt)
+            .await;
+
+        // Test custom records passed to SimGraph are passed to the interceptor in intercept_htlc.
+        assert_eq!(receiver.recv().await.unwrap(), custom_records);
+    }
+
+    /// Tests custom records set in multi-hop intercepted htlcs.
+    #[tokio::test]
+    async fn test_multi_hop_custom_records() {
+        let custom_records = HashMap::from([(1000, vec![1])]);
+        let mut mock_interceptor = MockTestInterceptor::new();
+
+        let (sender, mut receiver) = mpsc::channel::<CustomRecords>(1);
+        let sender_clone = sender.clone();
+        mock_interceptor
+            .expect_intercept_htlc()
+            .returning(move |req: InterceptRequest| {
+                let sender_clone = sender_clone.clone();
+                tokio::spawn(async move {
+                    let response_sender = req.response;
+                    // Do not send the custom records to the 2nd hop.
+                    response_sender
+                        .send(Ok(Ok(CustomRecords::default())))
+                        .await
+                        .unwrap();
+
+                    sender_clone
+                        .send(req.incoming_custom_records.clone())
+                        .await
+                        .unwrap();
+                });
+            });
+        mock_interceptor
+            .expect_intercept_htlc()
+            .returning(move |req: InterceptRequest| {
+                let sender = sender.clone();
+                tokio::spawn(async move {
+                    let response_sender = req.response;
+                    response_sender
+                        .send(Ok(Ok(CustomRecords::default())))
+                        .await
+                        .unwrap();
+
+                    sender
+                        .send(req.incoming_custom_records.clone())
+                        .await
+                        .unwrap();
+                });
+            });
+
+        mock_interceptor
+            .expect_notify_resolution()
+            .returning(|_| Ok(()));
+
+        let chan_capacity = 500_000_000;
+        let mut test_kit = DispatchPaymentTestKit::new(
+            chan_capacity,
+            custom_records.clone(),
+            vec![Arc::new(mock_interceptor)],
+        )
+        .await;
+
+        let amt = 150_000;
+        let _ = test_kit
+            .send_test_payemnt(test_kit.nodes[0], test_kit.nodes[2], amt)
+            .await;
+
+        // Test first hop has the custom records passed to SimGraph.
+        assert_eq!(receiver.recv().await.unwrap(), custom_records);
+        // Custom records were not passed to the 2nd hop so records received here should be empty.
+        assert_eq!(receiver.recv().await.unwrap(), CustomRecords::default());
     }
 }
