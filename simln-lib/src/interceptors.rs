@@ -78,6 +78,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn test_request() -> (
         InterceptRequest,
         tokio::sync::mpsc::Receiver<
@@ -88,6 +89,7 @@ mod tests {
         let (_, pk) = get_random_keypair();
         let request = InterceptRequest {
             response: sender,
+            payment_hash: lightning::ln::PaymentHash([0; 32]),
             forwarding_node: pk,
             incoming_htlc: HtlcRef {
                 channel_id: ShortChannelID::from(123),

@@ -4,7 +4,7 @@ use futures::executor::block_on;
 use log::LevelFilter;
 use simln_lib::clock::SimulationClock;
 use simln_lib::interceptors::LatencyIntercepor;
-use simln_lib::sim_node::{node_info, Interceptor, SimGraph, SimulatedChannel};
+use simln_lib::sim_node::{node_info, CustomRecords, Interceptor, SimGraph, SimulatedChannel};
 use simln_lib::{ActivityParser, NodeInfo, SimulationCfg, WriteResults};
 use std::collections::HashMap;
 use std::fs;
@@ -203,7 +203,6 @@ pub async fn create_simulation(
             vec![]
         };
 
-        let (shutdown_trigger, shutdown_listener) = triggered::trigger();
         let (simulation, graph) = Simulation::new_with_sim_network(
             cfg,
             channels,
@@ -211,9 +210,9 @@ pub async fn create_simulation(
             Arc::new(SimulationClock::new(
                 cli.clock_speedup.unwrap_or(DEFAULT_CLOCK_SPEEDUP),
             )?),
+            CustomRecords::default(),
             interceptors,
-            shutdown_listener,
-            shutdown_trigger,
+            triggered::trigger(),
         )
         .await?;
         Ok((simulation, Some(graph)))

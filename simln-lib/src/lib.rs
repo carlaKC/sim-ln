@@ -16,6 +16,7 @@ use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use random_activity::RandomActivityError;
 use serde::{Deserialize, Serialize};
+use sim_node::CustomRecords;
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::marker::Send;
@@ -592,20 +593,20 @@ impl Simulation {
         channels: Vec<SimulatedChannel>,
         activity: Vec<ActivityDefinition>,
         clock: Arc<dyn Clock>,
+        custom_records: CustomRecords,
         interceptors: Vec<Arc<dyn Interceptor>>,
-        shutdown_listener: Listener,
-        shutdown_trigger: Trigger,
+        shutdown: (Trigger, Listener),
     ) -> Result<(Self, Arc<Mutex<SimGraph>>), SimulationError> {
-
         // Setup a simulation graph that will handle propagation of payments through the network.
         let simulation_graph = Arc::new(Mutex::new(
             SimGraph::new(
                 channels.clone(),
                 clock.clone(),
                 cfg.write_results.clone(),
+                custom_records,
                 interceptors,
-                shutdown_listener.clone(),
-                shutdown_trigger.clone(),
+                shutdown.1.clone(),
+                shutdown.0.clone(),
             )
             .map_err(|e| SimulationError::SimulatedNetworkError(format!("{:?}", e)))?,
         ));
@@ -624,8 +625,8 @@ impl Simulation {
             Self {
                 nodes, // Here we should filter nodes out!
                 activity,
-                shutdown_trigger,
-                shutdown_listener,
+                shutdown_trigger: shutdown.0,
+                shutdown_listener: shutdown.1,
                 cfg,
                 clock,
             },
