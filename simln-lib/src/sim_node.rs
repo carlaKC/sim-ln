@@ -22,7 +22,9 @@ use lightning::ln::msgs::{
 use lightning::ln::{PaymentHash, PaymentPreimage};
 use lightning::routing::gossip::{NetworkGraph, NodeId};
 use lightning::routing::router::{find_route, Path, PaymentParameters, Route, RouteParameters};
-use lightning::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringDecayParameters};
+use lightning::routing::scoring::{
+    ProbabilisticScorer, ProbabilisticScoringDecayParameters, ScoreUpdate,
+};
 use lightning::routing::utxo::{UtxoLookup, UtxoResult};
 use lightning::util::logger::{Level, Logger, Record};
 use thiserror::Error;
@@ -704,6 +706,16 @@ impl<T: SimNetwork> LightningNode for SimNode<'_, T> {
                     // If we get a payment result back, remove from our in flight set of payments and return the result.
                     res = in_flight.track_payemnt_receiver => {
                         res.map_err(|e| LightningError::TrackPaymentError(format!("channel receive err: {}", e)))?
+                        let track_result = res.map_err(|e| LightningError::TrackPaymentError(format!("channel receive err: {}", e)))?;
+                        if let Ok(payment_result) = track_result {
+                            // TODO: we need to track payment path and return the failing index!
+                            if payment_result.payment_outcome == PaymentOutcome::Success {
+                                self.scorer.payment_path_successful();
+                            } else {
+                                self.scorer.payment_path_failed();
+                            }
+                        }
+                        track_result
                     },
                 }
             },
