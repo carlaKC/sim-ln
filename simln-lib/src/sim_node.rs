@@ -705,13 +705,15 @@ impl<T: SimNetwork> LightningNode for SimNode<'_, T> {
 
                     // If we get a payment result back, remove from our in flight set of payments and return the result.
                     res = in_flight.track_payemnt_receiver => {
-                        res.map_err(|e| LightningError::TrackPaymentError(format!("channel receive err: {}", e)))?
+                        res.map_err(|e| LightningError::TrackPaymentError(format!("channel receive err: {}", e)))?;
                         let track_result = res.map_err(|e| LightningError::TrackPaymentError(format!("channel receive err: {}", e)))?;
                         if let Ok(payment_result) = track_result {
+							let duration = self.clock().now(); // TODO - get the clock current time.
                             // TODO: we need to track payment path and return the failing index!
                             if payment_result.payment_outcome == PaymentOutcome::Success {
-                                self.scorer.payment_path_successful();
+                                self.scorer.payment_path_successful(in_flight.path);
                             } else {
+								// TODO: match on payment failure being at index and report.
                                 self.scorer.payment_path_failed();
                             }
                         }
