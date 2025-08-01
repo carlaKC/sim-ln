@@ -195,6 +195,31 @@ impl RandomPaymentActivity {
 
         Ok(())
     }
+
+    fn log_normal_parameters(
+        &self,
+        destination_capacity: Option<u64>,
+    ) -> Result<(f64, f64), PaymentGenerationError> {
+        let destination_capacity = destination_capacity.ok_or(PaymentGenerationError(
+            "destination amount required for payment activity generator".to_string(),
+        ))?;
+
+        let payment_limit = std::cmp::min(self.source_capacity, destination_capacity) / 2;
+
+        let ln_pmt_amt = (self.expected_payment_amt as f64).ln();
+        let ln_limit = (payment_limit as f64).ln();
+
+        let mu = 2.0 * ln_pmt_amt - ln_limit;
+        let sigma_square = 2.0 * (ln_limit - ln_pmt_amt);
+
+        if sigma_square < 0.0 {
+            return Err(PaymentGenerationError(format!(
+                "payment amount not possible for limit: {payment_limit}, sigma squared: {sigma_square}"
+            )));
+        }
+
+        Ok((mu, sigma_square))
+    }
 }
 
 /// Returns the number of events that the simulation expects the node to process per month based on its capacity, a
@@ -246,24 +271,7 @@ impl PaymentGenerator for RandomPaymentActivity {
         &self,
         destination_capacity: Option<u64>,
     ) -> Result<u64, PaymentGenerationError> {
-        let destination_capacity = destination_capacity.ok_or(PaymentGenerationError(
-            "destination amount required for payment activity generator".to_string(),
-        ))?;
-
-        let payment_limit = std::cmp::min(self.source_capacity, destination_capacity) / 2;
-
-        let ln_pmt_amt = (self.expected_payment_amt as f64).ln();
-        let ln_limit = (payment_limit as f64).ln();
-
-        let mu = 2.0 * ln_pmt_amt - ln_limit;
-        let sigma_square = 2.0 * (ln_limit - ln_pmt_amt);
-
-        if sigma_square < 0.0 {
-            return Err(PaymentGenerationError(format!(
-                "payment amount not possible for limit: {payment_limit}, sigma squared: {sigma_square}"
-            )));
-        }
-
+        let (mu, sigma_square) = self.log_normal_parameters(destination_capacity)?;
         let log_normal = LogNormal::new(mu, sigma_square.sqrt())
             .map_err(|e| PaymentGenerationError(e.to_string()))?;
 
@@ -479,6 +487,42 @@ mod tests {
                 pag.payment_amount(None),
                 Err(PaymentGenerationError(..))
             ));
+        }
+
+        #[test]
+        fn test_expected_payment_total() {
+            // Asserts that we generate around our expected amount of payment totals in one month
+            // of operation, within two standard deviations.
+            let rng = MutRng::new(Some((u64::MAX, None)));
+            let source_capacity = 2_000_000;
+            let expected_payment = 10_000;
+
+            let pag =
+                RandomPaymentActivity::new(source_capacity, expected_payment, 1.0, rng).unwrap();
+
+            let mut total_wait_seconds = 0;
+            let mut total_payment_sent = 0;
+
+            while total_wait_seconds < SECONDS_PER_MONTH {
+                total_wait_seconds += pag.next_payment_wait().unwrap().as_secs();
+                total_payment_sent += pag.payment_amount(Some(source_capacity)).unwrap();
+            }
+
+            let (mu, sigma_square) = pag.log_normal_parameters(Some(source_capacity)).unwrap();
+            let std_dev =
+                ((sigma_square.exp() - 1.0) * ((mu * 2.0).exp() + sigma_square)).sqrt() as u64;
+
+            let (lower_amt, upper_amt) =
+                (source_capacity - std_dev * 2, source_capacity + std_dev * 2);
+
+            assert!(
+                total_payment_sent >= lower_amt,
+                "total payment: {total_payment_sent} < {lower_amt} (one std dev {std_dev}) after {total_wait_seconds} seconds"
+            );
+            assert!(
+                total_payment_sent <= upper_amt,
+                "total payment: {total_payment_sent} > upper threshold: {upper_amt} (one std dev {std_dev}) after {total_wait_seconds} seconds"
+            );
         }
     }
 }
