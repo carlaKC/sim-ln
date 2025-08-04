@@ -493,7 +493,7 @@ mod tests {
         fn test_expected_payment_total() {
             // Asserts that we generate around our expected amount of payment totals in one month
             // of operation, within two standard deviations.
-            let rng = MutRng::new(Some((u64::MAX, None)));
+            let rng = MutRng::new(None);
             let source_capacity = 2_000_000;
             let expected_payment = 10_000;
 
@@ -505,23 +505,24 @@ mod tests {
 
             while total_wait_seconds < SECONDS_PER_MONTH {
                 total_wait_seconds += pag.next_payment_wait().unwrap().as_secs();
-                total_payment_sent += pag.payment_amount(Some(source_capacity)).unwrap();
+                let next_payment = pag.payment_amount(Some(source_capacity)).unwrap();
+                total_payment_sent += next_payment;
             }
 
             let (mu, sigma_square) = pag.log_normal_parameters(Some(source_capacity)).unwrap();
             let std_dev =
-                ((sigma_square.exp() - 1.0) * ((mu * 2.0).exp() + sigma_square)).sqrt() as u64;
+                (((sigma_square).exp() - 1.0) * ((2.0 * mu + sigma_square).exp())).sqrt() as u64;
 
             let (lower_amt, upper_amt) =
                 (source_capacity - std_dev * 2, source_capacity + std_dev * 2);
 
             assert!(
                 total_payment_sent >= lower_amt,
-                "total payment: {total_payment_sent} < {lower_amt} (one std dev {std_dev}) after {total_wait_seconds} seconds"
+                "total payment: {total_payment_sent} < {lower_amt} (two std dev {std_dev}) after {total_wait_seconds} seconds"
             );
             assert!(
                 total_payment_sent <= upper_amt,
-                "total payment: {total_payment_sent} > upper threshold: {upper_amt} (one std dev {std_dev}) after {total_wait_seconds} seconds"
+                "total payment: {total_payment_sent} > upper threshold: {upper_amt} (two std dev {std_dev}) after {total_wait_seconds} seconds"
             );
         }
     }
