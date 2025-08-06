@@ -820,30 +820,18 @@ impl<C: Clock + 'static> Simulation<C> {
             },
         };
 
-        // Next, we'll spin up our actual producers that will be responsible for triggering the configured activity.
-        // The producers will use their own TaskTracker so that the simulation can be shutdown if they all finish.
-        let producer_tasks = TaskTracker::new();
+        // Next, it is necessary to generate all defined activities in a central place.
         match self
-            .dispatch_producers(activities, event_sender, &producer_tasks)
+            .setup_payment_events(activities, event_sender, &self.tasks)
             .await
         {
             Ok(_) => {},
             Err(e) => {
-                // If we encounter an error in dispatch_producers, we need to shutdown and return.
+                // If we encounter an error in setup_payment_events, we need to shutdown and return.
                 self.shutdown();
                 return Err(e);
             },
         }
-
-        // Start a task that waits for the producers to finish.
-        // If all producers finish, then there is nothing left to do and the simulation can be shutdown.
-        let producer_trigger = self.shutdown_trigger.clone();
-        self.tasks.spawn(async move {
-            producer_tasks.close();
-            producer_tasks.wait().await;
-            log::info!("All producers finished. Shutting down.");
-            producer_trigger.trigger()
-        });
 
         // Start a task that will shutdown the simulation if the total_time is met.
         if let Some(total_time) = self.cfg.total_time {
@@ -1056,9 +1044,8 @@ impl<C: Clock + 'static> Simulation<C> {
         Ok(generators)
     }
 
-    /// Responsible for spinning up producers for a set of activities. Requires that a consumer channel is present
-    /// for every source node in the set of executors.
-    async fn dispatch_producers(
+    /// It is the central place responsible for create payment events.
+    async fn setup_payment_events(
         &self,
         mut executors: Vec<ExecutorKit>,
         output_sender: Sender<SimulationOutput>,
@@ -1084,7 +1071,6 @@ impl<C: Clock + 'static> Simulation<C> {
         let ppe_shutdown = self.shutdown_trigger.clone();
 
         let listener = self.shutdown_listener.clone();
-        let shutdown = self.shutdown_trigger.clone();
         let clock = self.clock.clone();
         let task_clone = tasks.clone();
         let nodes = self.nodes.clone();
@@ -1092,7 +1078,7 @@ impl<C: Clock + 'static> Simulation<C> {
         tasks.spawn(async move {
             let trackers = ProducePaymentEventsTrackers {
                 listener,
-                shutdown,
+                shutdown: ppe_shutdown.clone(),
                 tasks: task_clone,
             };
             if let Err(e) = produce_payment_events(
@@ -1108,11 +1094,170 @@ impl<C: Clock + 'static> Simulation<C> {
                 ppe_shutdown.trigger();
                 log::error!("Produce payment events exited with error: {e:?}.");
             } else {
+                ppe_shutdown.trigger();
                 log::debug!("Produce payment events completed successfully.");
             }
         });
         Ok(())
     }
+}
+
+async fn produce_payment_events<C: Clock>(
+    mut heap: BinaryHeap<Reverse<PaymentEvent>>,
+    mut payments_tracker: HashMap<PublicKey, ExecutorPaymentTracker>,
+    nodes: HashMap<PublicKey, Arc<Mutex<dyn LightningNode>>>,
+    clock: Arc<C>,
+    output_sender: Sender<SimulationOutput>,
+    trackers: ProducePaymentEventsTrackers,
+) -> Result<(), SimulationError> {
+    let ProducePaymentEventsTrackers {
+        listener,
+        shutdown,
+        tasks,
+    } = trackers;
+    loop {
+        select! {
+            biased;
+            _ = listener.clone()  => {
+                return Ok::<(), SimulationError>(())
+            },
+            _ = async {} => {
+                match heap.pop() {
+                    Some(Reverse(PaymentEvent {
+                        source,
+                        absolute_time,
+                        destination,
+                        amount
+                    })) => {
+                        let internal_now = clock.now();
+                        let wait_time = match absolute_time.duration_since(internal_now) {
+                            Ok(elapsed) => {
+                                // The output of duration_since is not perfectly round affecting the waiting time
+                                // and as consequence the results are not deterministic; for this reason
+                                // it is necessary to round the output.
+                                Duration::from_secs(elapsed.as_secs_f64().round() as u64)
+                            },
+                            Err(_e) => {
+                                Duration::from_secs(0)
+                            }
+                        };
+                        let payment_tracker = payments_tracker.get(&source).ok_or(SimulationError::PaymentGenerationError(
+                                PaymentGenerationError(format!("executor {} not found", source)),
+                        ))?;
+
+                        if let Some(c) = payment_tracker.executor.payment_generator.payment_count() {
+                            if c == payment_tracker.payments_completed {
+                                log::info!( "Payment count has been met for {}: {c} payments. Stopping the activity.", payment_tracker.executor.source_info);
+                                continue
+                            }
+                        }
+                        let node = nodes.get(&payment_tracker.executor.source_info.pubkey).ok_or(SimulationError::MissingNodeError(format!("Source node not found, {}", payment_tracker.executor.source_info.pubkey)))?.clone();
+
+                        // pe: produce events
+                        let pe_shutdown = shutdown.clone();
+                        let pe_clock = clock.clone();
+                        let pe_output_sender = output_sender.clone();
+
+                        // Only proceed with a payment if the amount is non-zero, otherwise skip this round. If we can't get
+                        // a payment amount something has gone wrong (because we should have validated that we can always
+                        // generate amounts), so we exit.
+                        if amount == 0 {
+                            log::debug!(
+                                "Skipping zero amount payment for {source} -> {}.", destination
+                            );
+                            generate_payment(&mut heap, source, payment_tracker.payments_completed, &mut payments_tracker, clock.now()).await?;
+                            continue;
+                        }
+
+                        let next_payment_count = payment_tracker.payments_completed + 1;
+                        payments_tracker
+                            .entry(source)
+                            .and_modify(|p| p.payments_completed = next_payment_count);
+
+                        select! {
+                            biased;
+                            _ = listener.clone()  => {
+                                return Ok(())
+                            },
+                            // Wait until our time to next payment has elapsed then execute a random amount payment to a random
+                            // destination.
+                            _ = pe_clock.sleep(wait_time) => {
+                                generate_payment(&mut heap, source, next_payment_count, &mut payments_tracker, clock.now()).await?;
+
+                                tasks.spawn(async move {
+                                    log::debug!("Generated payment: {source} -> {}: {amount} msat.", destination);
+
+                                    // Send the payment, exiting if we can no longer send to the consumer.
+                                    let event = SimulationEvent::SendPayment(destination.clone(), amount);
+                                    if let Err(e) = send_payment(node, pe_output_sender, event.clone()).await {
+                                        pe_shutdown.trigger();
+                                        log::debug!("Not able to send event payment for {amount}: {source} -> {}. Exited with error {e}.", destination);
+                                    } else {
+
+                                        log::debug!("Send event payment for {source} completed successfully.");
+                                    }
+                                });
+                            }
+                        }
+                    },
+                    None => {
+                        log::debug!("No more payments in queue to process");
+                        break
+                    },
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn generate_payment(
+    heap: &mut BinaryHeap<Reverse<PaymentEvent>>,
+    pubkey: PublicKey,
+    current_count: u64,
+    payments_tracker: &mut HashMap<PublicKey, ExecutorPaymentTracker>,
+    base_time: SystemTime,
+) -> Result<(), SimulationError> {
+    let payment_tracker =
+        payments_tracker
+            .get(&pubkey)
+            .ok_or(SimulationError::PaymentGenerationError(
+                PaymentGenerationError(format!("executor {} not found", pubkey)),
+            ))?;
+    let wait_time = get_payment_delay(
+        current_count,
+        &payment_tracker.executor.source_info,
+        payment_tracker.executor.payment_generator.as_ref(),
+    )?;
+    let absolute_time = base_time
+        .checked_add(wait_time)
+        .ok_or("Overflow adding duration")
+        .map_err(|e| {
+            SimulationError::PaymentGenerationError(PaymentGenerationError(format!(
+                "Unable to generate absolute_time for next payment with error {e}"
+            )))
+        })?;
+
+    let (destination, capacity) = payment_tracker
+        .executor
+        .network_generator
+        .choose_destination(payment_tracker.executor.source_info.pubkey)
+        .map_err(SimulationError::DestinationGenerationError)?;
+
+    let amount = payment_tracker
+        .executor
+        .payment_generator
+        .payment_amount(capacity)
+        .map_err(SimulationError::PaymentGenerationError)?;
+
+    let payment_event = PaymentEvent {
+        source: pubkey,
+        absolute_time,
+        destination,
+        amount,
+    };
+    heap.push(Reverse(payment_event));
+    Ok(())
 }
 
 /// events that are crated for a lightning node that we can execute events on. Any output that is generated from the
@@ -1441,163 +1586,6 @@ async fn track_payment_result(
 
     log::trace!("Result tracking complete. Payment result tracker exiting.");
 
-    Ok(())
-}
-
-async fn generate_payment(
-    heap: &mut BinaryHeap<Reverse<PaymentEvent>>,
-    pubkey: PublicKey,
-    current_count: u64,
-    payments_tracker: &mut HashMap<PublicKey, ExecutorPaymentTracker>,
-    base_time: SystemTime,
-) -> Result<(), SimulationError> {
-    let payment_tracker =
-        payments_tracker
-            .get(&pubkey)
-            .ok_or(SimulationError::PaymentGenerationError(
-                PaymentGenerationError(format!("executor {} not found", pubkey)),
-            ))?;
-    let wait_time = get_payment_delay(
-        current_count,
-        &payment_tracker.executor.source_info,
-        payment_tracker.executor.payment_generator.as_ref(),
-    )?;
-    let absolute_time = base_time
-        .checked_add(wait_time)
-        .ok_or("Overflow adding duration")
-        .map_err(|e| {
-            SimulationError::PaymentGenerationError(PaymentGenerationError(format!(
-                "Unable to generate absolute_time for next payment with error {e}"
-            )))
-        })?;
-
-    let (destination, capacity) = payment_tracker
-        .executor
-        .network_generator
-        .choose_destination(payment_tracker.executor.source_info.pubkey)
-        .map_err(SimulationError::DestinationGenerationError)?;
-
-    let amount = payment_tracker
-        .executor
-        .payment_generator
-        .payment_amount(capacity)
-        .map_err(SimulationError::PaymentGenerationError)?;
-
-    payments_tracker
-        .entry(payment_tracker.executor.source_info.pubkey)
-        .and_modify(|p| p.payments_completed = current_count);
-
-    let payment_event = PaymentEvent {
-        source: pubkey,
-        absolute_time,
-        destination,
-        amount,
-    };
-    heap.push(Reverse(payment_event));
-    Ok(())
-}
-
-async fn produce_payment_events<C: Clock>(
-    mut heap: BinaryHeap<Reverse<PaymentEvent>>,
-    mut payments_tracker: HashMap<PublicKey, ExecutorPaymentTracker>,
-    nodes: HashMap<PublicKey, Arc<Mutex<dyn LightningNode>>>,
-    clock: Arc<C>,
-    output_sender: Sender<SimulationOutput>,
-    trackers: ProducePaymentEventsTrackers,
-) -> Result<(), SimulationError> {
-    let ProducePaymentEventsTrackers {
-        listener,
-        shutdown,
-        tasks,
-    } = trackers;
-    loop {
-        select! {
-            biased;
-            _ = listener.clone()  => {
-                return Ok::<(), SimulationError>(())
-            },
-            _ = async {} => {
-                match heap.pop() {
-                    Some(Reverse(PaymentEvent {
-                        source,
-                        absolute_time,
-                        destination,
-                        amount
-                    })) => {
-                        let internal_now = clock.now();
-                        let wait_time = match absolute_time.duration_since(internal_now) {
-                            Ok(elapsed) => {
-                                // The output of duration_since is not perfectly round affecting the waiting time
-                                // and as consequence the results are not deterministic; for this reason
-                                // it is necessary to round the output.
-                                Duration::from_secs(elapsed.as_secs_f64().round() as u64)
-                            },
-                            Err(_e) => {
-                                Duration::from_secs(0)
-                            }
-                        };
-                        let payment_tracker = payments_tracker.get(&source).ok_or(SimulationError::PaymentGenerationError(
-                                PaymentGenerationError(format!("executor {} not found", source)),
-                        ))?;
-                        if let Some(c) = payment_tracker.executor.payment_generator.payment_count() {
-                            if c == payment_tracker.payments_completed {
-                                log::info!( "Payment count has been met for {}: {c} payments. Stopping the activity.", payment_tracker.executor.source_info);
-                                continue
-                            }
-                        }
-                        let node = nodes.get(&payment_tracker.executor.source_info.pubkey).ok_or(SimulationError::MissingNodeError(format!("Source node not found, {}", payment_tracker.executor.source_info.pubkey)))?.clone();
-
-                        // pe: produce events
-                        let pe_shutdown = shutdown.clone();
-                        let pe_clock = clock.clone();
-                        let pe_output_sender = output_sender.clone();
-
-                        // Only proceed with a payment if the amount is non-zero, otherwise skip this round. If we can't get
-                        // a payment amount something has gone wrong (because we should have validated that we can always
-                        // generate amounts), so we exit.
-                        if amount == 0 {
-                            log::debug!(
-                                "Skipping zero amount payment for {source} -> {}.", destination
-                            );
-                            generate_payment(&mut heap, source, payment_tracker.payments_completed, &mut payments_tracker, clock.now()).await?;
-                            continue;
-                        }
-
-                        // Wait until our time to next payment has elapsed then execute a random amount payment to a random
-                        // destination.
-                        let next_payment_count = payment_tracker.payments_completed + 1;
-                        select! {
-                            biased;
-                            _ = listener.clone()  => {
-                                return Ok(())
-                            },
-                            _ = pe_clock.sleep(wait_time) => {
-                                generate_payment(&mut heap, source, next_payment_count, &mut payments_tracker, clock.now()).await?;
-
-                                tasks.spawn(async move {
-                                    log::debug!("Generated payment: {source} -> {}: {amount} msat.", destination);
-
-                                    // Send the payment, exiting if we can no longer send to the consumer.
-                                    let event = SimulationEvent::SendPayment(destination.clone(), amount);
-                                    if let Err(e) = send_payment(node, pe_output_sender, event.clone()).await {
-                                        pe_shutdown.trigger();
-                                        log::debug!("Not able to send event payment for {amount}: {source} -> {}. Exited with error {e}.", destination);
-                                    } else {
-
-                                        log::debug!("Send event payment for {source} completed successfully.");
-                                    }
-                                });
-                            }
-                        }
-                    },
-                    None => {
-                        log::debug!("No more payment events placed to process");
-                        break
-                    },
-                }
-            }
-        }
-    }
     Ok(())
 }
 
