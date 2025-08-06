@@ -1921,8 +1921,20 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[tokio::test]
-    async fn test_deterministic_payments_events_defined_activities() {
+    #[allow(clippy::type_complexity)]
+    /// Helper to create and configure mock nodes for testing
+    fn setup_test_nodes_for_testing_deterministic_events(
+        fixed_pubkeys: Option<Vec<PublicKey>>,
+    ) -> (
+        (
+            crate::NodeInfo,
+            crate::NodeInfo,
+            crate::NodeInfo,
+            crate::NodeInfo,
+        ),
+        HashMap<PublicKey, Arc<Mutex<dyn LightningNode>>>,
+        Arc<StdMutex<Vec<PublicKey>>>,
+    ) {
         let (nodes, mut clients) = LightningTestNodeBuilder::new(4)
             .with_networks(vec![
                 Network::Regtest,
@@ -1937,8 +1949,15 @@ mod tests {
 
         let payments_list = Arc::new(StdMutex::new(Vec::new()));
 
+        if fixed_pubkeys.is_some() {
+            clients = HashMap::new();
+        }
+
         // Set up node 1 expectations
-        let node_1_clone = node_1.clone();
+        let mut node_1_clone = node_1.clone();
+        if let Some(ref pubkeys) = fixed_pubkeys {
+            node_1_clone.pubkey = pubkeys[0]
+        }
         mock_node_1
             .expect_get_info()
             .return_const(node_1_clone.clone());
@@ -1963,14 +1982,21 @@ mod tests {
             Ok(lightning::ln::PaymentHash([0; 32]))
         });
 
-        clients.insert(node_1.pubkey, Arc::new(Mutex::new(mock_node_1)));
+        if let Some(ref pubkeys) = fixed_pubkeys {
+            clients.insert(pubkeys[0], Arc::new(Mutex::new(mock_node_1)));
+        } else {
+            clients.insert(node_1.pubkey, Arc::new(Mutex::new(mock_node_1)));
+        }
 
         let node_2 = &nodes[1];
 
         let mut mock_node_2 = MockLightningNode::new();
 
         // Set up node 2 expectations
-        let node_2_clone = node_2.clone();
+        let mut node_2_clone = node_2.clone();
+        if let Some(ref pubkeys) = fixed_pubkeys {
+            node_2_clone.pubkey = pubkeys[1]
+        }
         mock_node_2
             .expect_get_info()
             .return_const(node_2_clone.clone());
@@ -1989,18 +2015,27 @@ mod tests {
                 payment_outcome: crate::PaymentOutcome::Success,
             })
         });
-        mock_node_2
-            .expect_send_payment()
-            .returning(move |_, _| Ok(lightning::ln::PaymentHash([1; 32])));
+        let pl2 = payments_list.clone();
+        mock_node_2.expect_send_payment().returning(move |a, _| {
+            pl2.lock().unwrap().push(a);
+            Ok(lightning::ln::PaymentHash([1; 32]))
+        });
 
-        clients.insert(node_2.pubkey, Arc::new(Mutex::new(mock_node_2)));
+        if let Some(ref pubkeys) = fixed_pubkeys {
+            clients.insert(pubkeys[1], Arc::new(Mutex::new(mock_node_2)));
+        } else {
+            clients.insert(node_2.pubkey, Arc::new(Mutex::new(mock_node_2)));
+        }
 
         let node_3 = &nodes[2];
 
         let mut mock_node_3 = MockLightningNode::new();
 
-        // Set up node 2 expectations
-        let node_3_clone = node_3.clone();
+        // Set up node 3 expectations
+        let mut node_3_clone = node_3.clone();
+        if let Some(ref pubkeys) = fixed_pubkeys {
+            node_3_clone.pubkey = pubkeys[2]
+        }
         mock_node_3
             .expect_get_info()
             .return_const(node_3_clone.clone());
@@ -2025,14 +2060,21 @@ mod tests {
             Ok(lightning::ln::PaymentHash([2; 32]))
         });
 
-        clients.insert(node_3.pubkey, Arc::new(Mutex::new(mock_node_3)));
+        if let Some(ref pubkeys) = fixed_pubkeys {
+            clients.insert(pubkeys[2], Arc::new(Mutex::new(mock_node_3)));
+        } else {
+            clients.insert(node_3.pubkey, Arc::new(Mutex::new(mock_node_3)));
+        }
 
         let node_4 = &nodes[3];
 
         let mut mock_node_4 = MockLightningNode::new();
 
-        // Set up node 2 expectations
-        let node_4_clone = node_4.clone();
+        // Set up node 4 expectations
+        let mut node_4_clone = node_4.clone();
+        if let Some(ref pubkeys) = fixed_pubkeys {
+            node_4_clone.pubkey = pubkeys[3]
+        }
         mock_node_4
             .expect_get_info()
             .return_const(node_4_clone.clone());
@@ -2051,11 +2093,34 @@ mod tests {
                 payment_outcome: crate::PaymentOutcome::Success,
             })
         });
-        mock_node_4
-            .expect_send_payment()
-            .returning(move |_, _| Ok(lightning::ln::PaymentHash([3; 32])));
+        let pl4 = payments_list.clone();
+        mock_node_4.expect_send_payment().returning(move |a, _| {
+            pl4.lock().unwrap().push(a);
+            Ok(lightning::ln::PaymentHash([3; 32]))
+        });
 
-        clients.insert(node_4.pubkey, Arc::new(Mutex::new(mock_node_4)));
+        if let Some(ref pubkeys) = fixed_pubkeys {
+            clients.insert(pubkeys[3], Arc::new(Mutex::new(mock_node_4)));
+        } else {
+            clients.insert(node_4.pubkey, Arc::new(Mutex::new(mock_node_4)));
+        }
+
+        (
+            (
+                node_1.clone(),
+                node_2.clone(),
+                node_3.clone(),
+                node_4.clone(),
+            ),
+            clients,
+            payments_list,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_deterministic_payments_events_defined_activities() {
+        let ((node_1, node_2, node_3, node_4), clients, payments_list) =
+            setup_test_nodes_for_testing_deterministic_events(None);
 
         // Define two activities
         // Activity 1: From node_1 to node_2
@@ -2063,9 +2128,9 @@ mod tests {
             source: node_1.clone(),
             destination: node_2.clone(),
             start_secs: None,
-            count: Some(5),                                // 10 payments
-            interval_secs: crate::ValueOrRange::Value(2),  // 2 second interval
-            amount_msat: crate::ValueOrRange::Value(2000), // 2000 msats
+            count: Some(5),
+            interval_secs: crate::ValueOrRange::Value(2),
+            amount_msat: crate::ValueOrRange::Value(2000),
         };
 
         // Activity 2: From node_3 to node_4
@@ -2073,21 +2138,21 @@ mod tests {
             source: node_3.clone(),
             destination: node_4.clone(),
             start_secs: None,
-            count: Some(5),                                // 10 payments
-            interval_secs: crate::ValueOrRange::Value(4),  // 4 second interval
-            amount_msat: crate::ValueOrRange::Value(3000), // 3000 msats
+            count: Some(5),
+            interval_secs: crate::ValueOrRange::Value(4),
+            amount_msat: crate::ValueOrRange::Value(3000),
         };
 
         let (shutdown_trigger, shutdown_listener) = triggered::trigger();
 
-        // Create simulation with a long timeout that we don't expect to be reached
+        // Create simulation without a timeout
         let simulation = Simulation::new(
             SimulationCfg::new(
-                None,     // without timeout
-                100,      // Expected payment size
-                2.0,      // Activity multiplier
-                None,     // No result writing
-                Some(42), // Seed for determinism
+                None, // without timeout
+                100,  // Expected payment size
+                2.0,  // Activity multiplier
+                None, // No result writing
+                None, // Seed for determinism
             ),
             clients,
             TaskTracker::new(),
@@ -2096,7 +2161,7 @@ mod tests {
             shutdown_listener,
         );
 
-        // Run the simulation (should be interrupted by the error)
+        // Run the simulation
         let start = std::time::Instant::now();
         let _ = simulation.run(&vec![activity_1, activity_2]).await;
         let elapsed = start.elapsed();
@@ -2132,14 +2197,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_deterministic_payments_events_random() {
-        let (nodes, _) = LightningTestNodeBuilder::new(4)
-            .with_networks(vec![
-                Network::Regtest,
-                Network::Regtest,
-                Network::Regtest,
-                Network::Regtest,
-            ])
-            .build_full();
         let pk1 = PublicKey::from_str(
             "02f6dc1fcf3431f461ff5e6d870f286e134b064fddd3795a98d5903c55e76cfa8c",
         )
@@ -2156,140 +2213,9 @@ mod tests {
             "026389dd21b3611bf4bb78f8939d5912f3175107ff9c14b6881bb4bef0e7c6e905",
         )
         .unwrap();
-        let mut clients: HashMap<PublicKey, Arc<Mutex<dyn LightningNode>>> = HashMap::new();
-        let payments_list = Arc::new(StdMutex::new(Vec::new()));
 
-        let node_1 = &nodes[0];
-        let mut mock_node_1 = MockLightningNode::new();
-
-        // Set up node 1 expectations
-        let mut node_1_clone = node_1.clone();
-        node_1_clone.alias = "node_1_clone".to_string();
-        node_1_clone.pubkey = pk1;
-        mock_node_1
-            .expect_get_info()
-            .return_const(node_1_clone.clone());
-        mock_node_1
-            .expect_get_network()
-            .returning(|| Network::Regtest);
-        mock_node_1
-            .expect_list_channels()
-            .returning(|| Ok(vec![100_000_000]));
-        mock_node_1
-            .expect_get_node_info()
-            .returning(move |_| Ok(node_1_clone.clone()));
-        mock_node_1.expect_track_payment().returning(|_, _| {
-            Ok(crate::PaymentResult {
-                htlc_count: 1,
-                payment_outcome: crate::PaymentOutcome::Success,
-            })
-        });
-        let pl1 = payments_list.clone();
-        mock_node_1.expect_send_payment().returning(move |a, _| {
-            pl1.lock().unwrap().push(a);
-            Ok(lightning::ln::PaymentHash([0; 32]))
-        });
-
-        clients.insert(pk1, Arc::new(Mutex::new(mock_node_1)));
-        let node_2 = &nodes[1];
-
-        let mut mock_node_2 = MockLightningNode::new();
-
-        // Set up node 2 expectations
-        let mut node_2_clone = node_2.clone();
-        node_2_clone.alias = "node_2_clone".to_string();
-        node_2_clone.pubkey = pk2;
-        mock_node_2
-            .expect_get_info()
-            .return_const(node_2_clone.clone());
-        mock_node_2
-            .expect_get_network()
-            .returning(|| Network::Regtest);
-        mock_node_2
-            .expect_list_channels()
-            .returning(|| Ok(vec![100_000_000]));
-        mock_node_2
-            .expect_get_node_info()
-            .returning(move |_| Ok(node_2_clone.clone()));
-        mock_node_2.expect_track_payment().returning(|_, _| {
-            Ok(crate::PaymentResult {
-                htlc_count: 1,
-                payment_outcome: crate::PaymentOutcome::Success,
-            })
-        });
-        let pl2 = payments_list.clone();
-        mock_node_2.expect_send_payment().returning(move |a, _| {
-            pl2.lock().unwrap().push(a);
-            Ok(lightning::ln::PaymentHash([1; 32]))
-        });
-
-        clients.insert(pk2, Arc::new(Mutex::new(mock_node_2)));
-        let node_3 = &nodes[2];
-
-        let mut mock_node_3 = MockLightningNode::new();
-
-        // Set up node 2 expectations
-        let mut node_3_clone = node_3.clone();
-        node_3_clone.alias = "node_3_clone".to_string();
-        node_3_clone.pubkey = pk3;
-        mock_node_3
-            .expect_get_info()
-            .return_const(node_3_clone.clone());
-        mock_node_3
-            .expect_get_network()
-            .returning(|| Network::Regtest);
-        mock_node_3
-            .expect_list_channels()
-            .returning(|| Ok(vec![100_000_000]));
-        mock_node_3
-            .expect_get_node_info()
-            .returning(move |_| Ok(node_3_clone.clone()));
-        mock_node_3.expect_track_payment().returning(|_, _| {
-            Ok(crate::PaymentResult {
-                htlc_count: 1,
-                payment_outcome: crate::PaymentOutcome::Success,
-            })
-        });
-        let pl3 = payments_list.clone();
-        mock_node_3.expect_send_payment().returning(move |a, _| {
-            pl3.lock().unwrap().push(a);
-            Ok(lightning::ln::PaymentHash([2; 32]))
-        });
-
-        clients.insert(pk3, Arc::new(Mutex::new(mock_node_3)));
-        let node_4 = &nodes[3];
-
-        let mut mock_node_4 = MockLightningNode::new();
-
-        // Set up node 2 expectations
-        let mut node_4_clone = node_4.clone();
-        node_4_clone.alias = "node_4_clone".to_string();
-        node_4_clone.pubkey = pk4;
-        mock_node_4
-            .expect_get_info()
-            .return_const(node_4_clone.clone());
-        mock_node_4
-            .expect_get_network()
-            .returning(|| Network::Regtest);
-        mock_node_4
-            .expect_list_channels()
-            .returning(|| Ok(vec![100_000_000]));
-        mock_node_4
-            .expect_get_node_info()
-            .returning(move |_| Ok(node_4_clone.clone()));
-        mock_node_4.expect_track_payment().returning(|_, _| {
-            Ok(crate::PaymentResult {
-                htlc_count: 1,
-                payment_outcome: crate::PaymentOutcome::Success,
-            })
-        });
-        let pl4 = payments_list.clone();
-        mock_node_4.expect_send_payment().returning(move |a, _| {
-            pl4.lock().unwrap().push(a);
-            Ok(lightning::ln::PaymentHash([3; 32]))
-        });
-
-        clients.insert(pk4, Arc::new(Mutex::new(mock_node_4)));
+        let (_, clients, payments_list) =
+            setup_test_nodes_for_testing_deterministic_events(Some(vec![pk1, pk2, pk3, pk4]));
 
         let (shutdown_trigger, shutdown_listener) = triggered::trigger();
 
@@ -2309,7 +2235,7 @@ mod tests {
             shutdown_listener,
         );
 
-        // Run the simulation (should be interrupted by the error)
+        // Run the simulation
         let start = std::time::Instant::now();
         let _ = simulation.run(&[]).await;
         let elapsed = start.elapsed();
@@ -2322,6 +2248,7 @@ mod tests {
         let expected_payment_list = vec![
             pk1, pk2, pk1, pk1, pk1, pk3, pk3, pk3, pk4, pk3, pk2, pk1, pk4,
         ];
+
         assert!(
             payments_list.lock().unwrap().as_ref() == expected_payment_list,
             "The expected order of payments is not correct"
@@ -2331,10 +2258,11 @@ mod tests {
         payments_list.lock().unwrap().clear();
 
         let (shutdown_trigger, shutdown_listener) = triggered::trigger();
+
         // Create the same simulation as before but with different seed
         let simulation2 = Simulation::new(
             SimulationCfg::new(
-                Some(25),  // 25 second timeout (shouldn't matter)
+                Some(25),  // 25 second timeout
                 100,       // Expected payment size
                 2.0,       // Activity multiplier
                 None,      // No result writing
