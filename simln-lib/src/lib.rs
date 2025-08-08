@@ -1128,7 +1128,7 @@ async fn produce_payment_events<C: Clock>(
                         amount
                     })) => {
                         let internal_now = clock.now();
-                        let wait_time = match absolute_time.duration_since(internal_now) {
+                        let wait_time = match execution_time.duration_since(internal_now) {
                             Ok(elapsed) => {
                                 // The output of duration_since is not perfectly round affecting the waiting time
                                 // and as consequence the results are not deterministic; for this reason
