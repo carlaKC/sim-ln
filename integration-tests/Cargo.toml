@@ -1,0 +1,25 @@
+[package]
+name = "integration-tests"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = """
+Integration test framework for sim-ln, covering simulated and real (dockerized) lightning networks.
+"""
+
+[dependencies]
+anyhow = { version = "1.0.69", features = ["backtrace"] }
+bitcoin = { version = "0.30.1", features = ["serde"] }
+csv = "1.2.2"
+log = "0.4.20"
+serde_json = "1.0.104"
+simln-lib = { path = "../simln-lib", features = ["virtual-time"] }
+sim-cli = { path = "../sim-cli" }
+tokio = { version = "1.31.0", features = ["full"] }
+tokio-util = { version = "0.7.13", features = ["rt"] }
+
+[dev-dependencies]
+ntest = "0.9.0"
+rstest = "0.23.0"
+tempfile = "3"
