@@ -1,6 +1,7 @@
 //! The environment layer: provisions a lightning network and describes it as a partial simulation
 //! config. Implementations know nothing about the payment activity that will run on the network.
 
+pub mod containers;
 pub mod simulated;
 
 use bitcoin::secp256k1::PublicKey;
